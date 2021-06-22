@@ -1,3 +1,5 @@
+The following is a sample example when evaluating with the R-Car V3U Falcon board.
+
 After starting the Kernel by applying Test_patch-media-vsp1-Change-ARGB8888-YCbCr-422-10bit.patch,
 Check that the display destination monitor has a greenish screen.
 Connect the Camera device to the Falcon board and execute the following command after starting Target.
