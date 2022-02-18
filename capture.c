@@ -1,13 +1,16 @@
 /*
  * Camera test application
  *
- * Copyright (C) 2016-2017 Renesas Electronics Corporation
+ * Copyright (C) 2022 Renesas Electronics Corporation
  * Copyright (C) 2016-2017 Cogent Embedded, Inc. <source@cogentembedded.com>
  *
  * based on:
  *  V4L2 video capture example
  *  This program is provided with the V4L2 API
  *  see http://linuxtv.org/docs.php for more information
+ *
+ *  DRM-Howto
+ *  https://github.com/dvdhrm/docs
  */
 
 #include <stdio.h>
@@ -26,8 +29,14 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 
+#include <stdbool.h>
+
 #include <linux/videodev2.h>
 #include <linux/fb.h>
+
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#include <drm_fourcc.h>
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 
@@ -44,6 +53,25 @@ struct buffer {
         void   *start;
         size_t  length;
 };
+
+struct modeset_dev {
+	struct modeset_dev *next;
+
+	uint32_t width;
+	uint32_t height;
+	uint32_t stride;
+	uint32_t size;
+	uint32_t handle;
+	uint8_t *map;
+
+	drmModeModeInfo mode;
+	uint32_t fb;
+	uint32_t conn;
+	uint32_t crtc;
+	drmModeCrtc *saved_crtc;
+};
+
+static struct modeset_dev *modeset_list = NULL;
 
 #define N_DEVS_MAX      12
 static char             n_devs = 1;
@@ -804,6 +832,321 @@ static void close_fb(void)
         }
 }
 
+static int modeset_create_fb(int fd, struct modeset_dev *dev)
+{
+	struct drm_mode_create_dumb creq;
+	struct drm_mode_destroy_dumb dreq;
+	struct drm_mode_map_dumb mreq;
+	int ret;
+
+	/* create dumb buffer */
+	memset(&creq, 0, sizeof(creq));
+	creq.width = dev->width;
+	creq.height = dev->height;
+	creq.bpp = 32;
+	ret = drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq);
+	if (ret < 0) {
+		fprintf(stderr, "cannot create dumb buffer (%d): %m\n",
+			errno);
+		return -errno;
+	}
+	dev->stride = creq.pitch;
+	dev->size = creq.size;
+	dev->handle = creq.handle;
+
+	/* create framebuffer object for the dumb-buffer */
+	{
+		uint32_t fourcc = DRM_FORMAT_Y210;
+		uint32_t offsets[4] = { 0 };
+		uint32_t pitches[4] = {dev->stride};
+		uint32_t bo_handles[4] = {dev->handle};
+		ret = drmModeAddFB2(fd, dev->width, dev->height, fourcc,
+			bo_handles, pitches, offsets, &dev->fb, 0);
+	}
+	if (ret) {
+		fprintf(stderr, "cannot create framebuffer (%d): %m\n",
+			errno);
+		ret = -errno;
+		goto err_destroy;
+	}
+
+	/* prepare buffer for memory mapping */
+	memset(&mreq, 0, sizeof(mreq));
+	mreq.handle = dev->handle;
+	ret = drmIoctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq);
+	if (ret) {
+		fprintf(stderr, "cannot map dumb buffer (%d): %m\n",
+			errno);
+		ret = -errno;
+		goto err_fb;
+	}
+
+	/* perform actual memory mapping */
+	dev->map = mmap(0, dev->size, PROT_READ | PROT_WRITE, MAP_SHARED,
+		        fd, mreq.offset);
+	if (dev->map == MAP_FAILED) {
+		fprintf(stderr, "cannot mmap dumb buffer (%d): %m\n",
+			errno);
+		ret = -errno;
+		goto err_fb;
+	}
+
+	/* clear the framebuffer to 0 */
+	memset(dev->map, 100, dev->size);
+
+	return 0;
+
+err_fb:
+	drmModeRmFB(fd, dev->fb);
+err_destroy:
+	memset(&dreq, 0, sizeof(dreq));
+	dreq.handle = dev->handle;
+	drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+	return ret;
+}
+
+static int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn,
+			     struct modeset_dev *dev)
+{
+	drmModeEncoder *enc;
+	unsigned int i, j;
+	int32_t crtc;
+	struct modeset_dev *iter;
+
+	/* first try the currently conected encoder+crtc */
+	if (conn->encoder_id)
+		enc = drmModeGetEncoder(fd, conn->encoder_id);
+	else
+		enc = NULL;
+
+	if (enc) {
+		if (enc->crtc_id) {
+			crtc = enc->crtc_id;
+			for (iter = modeset_list; iter; iter = iter->next) {
+				if (iter->crtc == crtc) {
+					crtc = -1;
+					break;
+				}
+			}
+
+			if (crtc >= 0) {
+				drmModeFreeEncoder(enc);
+				dev->crtc = crtc;
+				return 0;
+			}
+		}
+
+		drmModeFreeEncoder(enc);
+	}
+
+	/* If the connector is not currently bound to an encoder or if the
+	 * encoder+crtc is already used by another connector (actually unlikely
+	 * but lets be safe), iterate all other available encoders to find a
+	 * matching CRTC. */
+	for (i = 0; i < conn->count_encoders; ++i) {
+		enc = drmModeGetEncoder(fd, conn->encoders[i]);
+		if (!enc) {
+			fprintf(stderr, "cannot retrieve encoder %u:%u (%d): %m\n",
+				i, conn->encoders[i], errno);
+			continue;
+		}
+
+		/* iterate all global CRTCs */
+		for (j = 0; j < res->count_crtcs; ++j) {
+			/* check whether this CRTC works with the encoder */
+			if (!(enc->possible_crtcs & (1 << j)))
+				continue;
+
+			/* check that no other device already uses this CRTC */
+			crtc = res->crtcs[j];
+			for (iter = modeset_list; iter; iter = iter->next) {
+				if (iter->crtc == crtc) {
+					crtc = -1;
+					break;
+				}
+			}
+
+			/* we have found a CRTC, so save it and return */
+			if (crtc >= 0) {
+				drmModeFreeEncoder(enc);
+				dev->crtc = crtc;
+				return 0;
+			}
+		}
+
+		drmModeFreeEncoder(enc);
+	}
+
+	fprintf(stderr, "cannot find suitable CRTC for connector %u\n",
+		conn->connector_id);
+	return -ENOENT;
+}
+
+static int modeset_setup_dev(int fd, drmModeRes *res, drmModeConnector *conn,
+			     struct modeset_dev *dev)
+{
+	int ret;
+
+	/* check if a monitor is connected */
+	if (conn->connection != DRM_MODE_CONNECTED) {
+		fprintf(stderr, "ignoring unused connector %u\n",
+			conn->connector_id);
+		return -ENOENT;
+	}
+
+	/* check if there is at least one valid mode */
+	if (conn->count_modes == 0) {
+		fprintf(stderr, "no valid mode for connector %u\n",
+			conn->connector_id);
+		return -EFAULT;
+	}
+
+	/* copy the mode information into our device structure */
+	memcpy(&dev->mode, &conn->modes[0], sizeof(dev->mode));
+	dev->width = conn->modes[0].hdisplay;
+	dev->height = conn->modes[0].vdisplay;
+	fprintf(stderr, "mode for connector %u is %ux%u\n",
+		conn->connector_id, dev->width, dev->height);
+
+	/* find a crtc for this connector */
+	ret = modeset_find_crtc(fd, res, conn, dev);
+	if (ret) {
+		fprintf(stderr, "no valid crtc for connector %u\n",
+			conn->connector_id);
+		return ret;
+	}
+
+	/* create a framebuffer for this CRTC */
+	ret = modeset_create_fb(fd, dev);
+	if (ret) {
+		fprintf(stderr, "cannot create framebuffer for connector %u\n",
+			conn->connector_id);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int modeset_prepare(int fd)
+{
+	drmModeRes *res;
+	drmModeConnector *conn;
+	unsigned int i;
+	struct modeset_dev *dev;
+	int ret;
+
+	/* retrieve resources */
+	res = drmModeGetResources(fd);
+	if (!res) {
+		fprintf(stderr, "cannot retrieve DRM resources (%d): %m\n",
+			errno);
+		return -errno;
+	}
+
+	/* iterate all connectors */
+	for (i = 0; i < res->count_connectors; ++i) {
+		/* get information for each connector */
+		conn = drmModeGetConnector(fd, res->connectors[i]);
+		if (!conn) {
+			fprintf(stderr, "cannot retrieve DRM connector %u:%u (%d): %m\n",
+				i, res->connectors[i], errno);
+			continue;
+		}
+
+		/* create a device structure */
+		dev = malloc(sizeof(*dev));
+		memset(dev, 0, sizeof(*dev));
+		dev->conn = conn->connector_id;
+
+		/* call helper function to prepare this connector */
+		ret = modeset_setup_dev(fd, res, conn, dev);
+		if (ret) {
+			if (ret != -ENOENT) {
+				errno = -ret;
+				fprintf(stderr, "cannot setup device for connector %u:%u (%d): %m\n",
+					i, res->connectors[i], errno);
+			}
+			free(dev);
+			drmModeFreeConnector(conn);
+			continue;
+		}
+
+		/* free connector data and link device into global list */
+		drmModeFreeConnector(conn);
+		dev->next = modeset_list;
+		modeset_list = dev;
+	}
+
+	/* free resources again */
+	drmModeFreeResources(res);
+	return 0;
+}
+
+static void connect_display(char* formatname, char* connector)
+{
+	uint16_t r, g, b;
+	bool r_up, g_up, b_up;
+	unsigned int i, j, k, off;
+	struct modeset_dev *iter;
+
+	srand(time(NULL));
+	r = 0xff;
+	g = 0xff;
+	b = 0xff;
+	r_up = g_up = b_up = true;
+
+	for (i = 0; i < 50; ++i) {
+		for (iter = modeset_list; iter; iter = iter->next) {
+			for (j = 0; j < iter->height; ++j) {
+				for (k = 0; k < iter->width; ++k) {
+					off = iter->stride * j + k * 4;
+					*(uint32_t*)&iter->map[off] =
+						     (r << 16) | (g << 8) | b;
+				}
+			}
+		}
+
+		usleep(100000);
+	}
+}
+
+static void modeset_cleanup(int fd)
+{
+	struct modeset_dev *iter;
+	struct drm_mode_destroy_dumb dreq;
+
+	while (modeset_list) {
+		/* remove from global list */
+		iter = modeset_list;
+		modeset_list = iter->next;
+
+		/* restore saved CRTC configuration */
+		drmModeSetCrtc(fd,
+			       iter->saved_crtc->crtc_id,
+			       iter->saved_crtc->buffer_id,
+			       iter->saved_crtc->x,
+			       iter->saved_crtc->y,
+			       &iter->conn,
+			       1,
+			       &iter->saved_crtc->mode);
+		drmModeFreeCrtc(iter->saved_crtc);
+
+		/* unmap buffer */
+		munmap(iter->map, iter->size);
+
+		/* delete framebuffer */
+		drmModeRmFB(fd, iter->fb);
+
+		/* delete dumb buffer */
+		memset(&dreq, 0, sizeof(dreq));
+		dreq.handle = iter->handle;
+		drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+
+		/* free allocated memory */
+		free(iter);
+	}
+}
+
 static void usage(FILE *fp, char **argv)
 {
         fprintf(fp,
@@ -818,7 +1161,7 @@ static void usage(FILE *fp, char **argv)
                  "-u | --userp         Use application allocated buffers\n"
                  "-o | --output        Outputs stream to stdout\n"
                  "-F | --output_fb     Outputs stream to framebuffer\n"
-                 "-f | --format        Set pixel format: uyvy, yuyv, rgb565, rgb32, nv12, nv16, bggr8, grey [%s]\n"
+                 "-f | --format        Set pixel format: raw10, uyvy, yuyv, rgb565, rgb32, nv12, nv16, bggr8, grey [%s]\n"
                  "-c | --count         Number of frames to grab [%i]\n"
                  "-z | --fps_count     Enable fps show\n"
                  "-s | --framerate     Set framerate\n"
@@ -861,7 +1204,7 @@ int main(int argc, char **argv)
         dev_name[0] = "/dev/video0";
         fbdev_name = "/dev/fb0";
         format_name = "uyvy";
-
+#if 0
         for (;;) {
                 int idx;
                 int c;
@@ -974,6 +1317,7 @@ int main(int argc, char **argv)
                 }
         }
 
+
         for (dev = 0; dev < n_devs; dev++) {
                 open_device(dev);
                 init_device(dev);
@@ -982,11 +1326,39 @@ int main(int argc, char **argv)
         open_fb();
         mainloop();
         close_fb();
+
         for (dev = 0; dev < n_devs; dev++) {
                 stop_capturing(dev);
                 uninit_device(dev);
                 close_device(dev);
         }
+#endif
+	int ret, fd;
+	struct modeset_dev *iter;
 
-        return 0;
+	/* Open DRM device */
+	fd = drmOpen("rcar-du", NULL);
+	if (fd < 0) {
+        fprintf(stderr, "Cannot open '%s': %d, %s\n",
+                "rcar-du", errno, strerror(errno));
+		return 0;
+	}
+	/* prepare all connectors and CRTCs */
+	ret = modeset_prepare(fd);
+	if (ret)
+		goto out_close;
+
+	/* perform actual modesetting on each found connector+CRTC */
+	for (iter = modeset_list; iter; iter = iter->next) {
+		iter->saved_crtc = drmModeGetCrtc(fd, iter->crtc);
+		ret = drmModeSetCrtc(fd, iter->crtc, iter->fb, 0, 0,
+				     &iter->conn, 1, &iter->mode);
+		if (ret)
+			fprintf(stderr, "cannot set CRTC for connector %u (%d): %m\n",
+				iter->conn, errno);
+	}
+	connect_display(format_name, "dp");
+out_close:
+	modeset_cleanup(fd);
+	return 0;
 }

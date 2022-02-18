@@ -9,13 +9,11 @@
 # the Free Software Foundation; either version 2 of the License.
 #
 
-%.o : %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+FLAGS=`pkg-config --cflags --libs libdrm`
+FLAGS+=-Wall -O0 -g
 
-all: capture
-
-capture: capture.o
-	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+all:
+	$(CC) -o capture capture.c $(FLAGS) $(CFLAGS) $(LDFLAGS) $(LIBS)
 
 distclean: clean
 clean:
