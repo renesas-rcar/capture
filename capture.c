@@ -97,7 +97,7 @@ static struct fb_var_screeninfo vinfo;
 static struct fb_fix_screeninfo finfo;
 static long int screensize = 0;
 static char *fbmem = 0;
-
+static uint32_t output_fourcc = DRM_FORMAT_ABGR8888;
 
 static void errno_exit(const char *s)
 {
@@ -171,17 +171,17 @@ static void process_image(const void *p, int size, int dev)
 
         if (out_fb) {
             if (!strncmp(format_name, "rgb32", 5) | !strncmp(format_name, "raw10", 5)) {
-                /* for RGB32 from camera: no need any convertion */
-                int i;
-                int offset = (WIDTH*4)*(dev%(n_devs > 4 ? 4 : 2)) + (HEIGHT*finfo.line_length)*(dev/(n_devs > 4 ? 4 : 2));
-                unsigned char *fbp = (unsigned char *)fbmem + offset;
-                char *buf = (char *)p;
+					int i;
+					int offset = (WIDTH*4)*(dev%(n_devs > 4 ? 4 : 2)) + (HEIGHT*modeset_list->stride)*(dev/(n_devs > 4 ? 4 : 2));
+					unsigned char *fbp = (unsigned char *)modeset_list->map + offset;
+					char *buf = (char *)p;
 
-                for (i = 0; i < HEIGHT; i++) {
-                        memcpy(fbp, buf, WIDTH*4);
-                        fbp += finfo.line_length;
-                        buf += (WIDTH*4);
-                }
+					for (i = 0; i < HEIGHT; i++) {
+						memcpy(fbp, buf, WIDTH*4);
+						fbp += modeset_list->stride;
+						buf += (WIDTH*4);
+					}
+
             } else if (!strncmp(format_name, "uyvy", 4)) {
                 /* for UYVY from camera: covert UYVY to RGB32 */
                 int i, j;
@@ -668,28 +668,6 @@ static void init_device(int dev)
                 errno_exit("VIDIOC_S_PARM");
         }
 
-#if 0
-    struct v4l2_control control;
-
-    memset(&control, 0, sizeof (control));
-    control.id = V4L2_CID_BRIGHTNESS;
-//    control.id = V4L2_CID_VFLIP;
-//    control.id = V4L2_CID_CONTRAST;
-//    control.id = V4L2_CID_SATURATION;
-//    control.id = V4L2_CID_GAMMA;
-//    control.id = V4L2_CID_GAIN;
-//    control.id = V4L2_CID_EXPOSURE;
-//    control.id = V4L2_CID_AUTOGAIN;
-
-    if (-1 == xioctl(fd[dev], VIDIOC_G_CTRL, &control))
-        errno_exit("VIDIOC_G_CTRL");
-
-    control.value = 0xf0;
-
-    if (-1 == ioctl(fd[dev], VIDIOC_S_CTRL, &control))
-        errno_exit("VIDIOC_S_CTRL");
-#endif
-
         CLEAR(fmt);
 
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -698,26 +676,54 @@ static void init_device(int dev)
         fmt.fmt.pix.field  = FIELD;
 
         if (!strncmp(format_name, "uyvy", 4))
+        {
                 fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_UYVY;
+                output_fourcc = DRM_FORMAT_UYVY;
+        }
         else if (!strncmp(format_name, "yuyv", 4))
+        {
                 fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+                output_fourcc = DRM_FORMAT_YUYV;
+        }
         else if (!strncmp(format_name, "rgb565", 6))
+        {
                 fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_RGB565;
+                output_fourcc = DRM_FORMAT_RGB565;
+        }
         else if (!strncmp(format_name, "rgb32", 5))
+        {
                 fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_XBGR32;
+                output_fourcc = DRM_FORMAT_XRGB8888;
+        }
         else if (!strncmp(format_name, "raw10", 5))
+        {
                 fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_Y10;
+                output_fourcc = DRM_FORMAT_Y210; /* For camera leopart GSML */
+        }
         else if (!strncmp(format_name, "nv12", 4))
+        {
                 fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+                output_fourcc = DRM_FORMAT_NV12;
+        }
         else if (!strncmp(format_name, "nv16", 4))
+        {
                 fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV16;
+                output_fourcc = DRM_FORMAT_NV16;
+        }
         else if (!strncmp(format_name, "bggr8", 5))
+        {
                 fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_SBGGR8;
+        }
         else if (!strncmp(format_name, "bggr12", 6))
+        {
                 fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_SBGGR12;
+        }
         else if (!strncmp(format_name, "grey", 4))
+        {
                 fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_GREY;
-        else {
+        }
+        else
+        {
                 /* Preserve original settings as set by v4l2-ctl for example */
                 if (-1 == xioctl(fd[dev], VIDIOC_G_FMT, &fmt))
                         errno_exit("VIDIOC_G_FMT");
@@ -725,8 +731,6 @@ static void init_device(int dev)
 
         if (-1 == xioctl(fd[dev], VIDIOC_S_FMT, &fmt))
                 errno_exit("VIDIOC_S_FMT");
-
-//        printf("fmt.fmt.pix.bytesperline =%d\n\n\n",fmt.fmt.pix.bytesperline);
 
         switch (io) {
         case IO_METHOD_READ:
@@ -856,7 +860,7 @@ static int modeset_create_fb(int fd, struct modeset_dev *dev)
 
 	/* create framebuffer object for the dumb-buffer */
 	{
-		uint32_t fourcc = DRM_FORMAT_Y210;
+		uint32_t fourcc = output_fourcc;
 		uint32_t offsets[4] = { 0 };
 		uint32_t pitches[4] = {dev->stride};
 		uint32_t bo_handles[4] = {dev->handle};
@@ -1082,34 +1086,6 @@ static int modeset_prepare(int fd)
 	return 0;
 }
 
-static void connect_display(char* formatname, char* connector)
-{
-	uint16_t r, g, b;
-	bool r_up, g_up, b_up;
-	unsigned int i, j, k, off;
-	struct modeset_dev *iter;
-
-	srand(time(NULL));
-	r = 0xff;
-	g = 0xff;
-	b = 0xff;
-	r_up = g_up = b_up = true;
-
-	for (i = 0; i < 50; ++i) {
-		for (iter = modeset_list; iter; iter = iter->next) {
-			for (j = 0; j < iter->height; ++j) {
-				for (k = 0; k < iter->width; ++k) {
-					off = iter->stride * j + k * 4;
-					*(uint32_t*)&iter->map[off] =
-						     (r << 16) | (g << 8) | b;
-				}
-			}
-		}
-
-		usleep(100000);
-	}
-}
-
 static void modeset_cleanup(int fd)
 {
 	struct modeset_dev *iter;
@@ -1204,7 +1180,9 @@ int main(int argc, char **argv)
         dev_name[0] = "/dev/video0";
         fbdev_name = "/dev/fb0";
         format_name = "uyvy";
-#if 0
+		int ret, fd;
+		struct modeset_dev *iter;
+
         for (;;) {
                 int idx;
                 int c;
@@ -1316,25 +1294,12 @@ int main(int argc, char **argv)
                         exit(EXIT_FAILURE);
                 }
         }
-
-
-        for (dev = 0; dev < n_devs; dev++) {
-                open_device(dev);
-                init_device(dev);
-                start_capturing(dev);
-        }
-        open_fb();
-        mainloop();
-        close_fb();
-
-        for (dev = 0; dev < n_devs; dev++) {
-                stop_capturing(dev);
-                uninit_device(dev);
-                close_device(dev);
-        }
-#endif
-	int ret, fd;
-	struct modeset_dev *iter;
+	/* Init Video Capture */
+	for (dev = 0; dev < n_devs; dev++) {
+		open_device(dev);
+		init_device(dev);
+		start_capturing(dev);
+	}
 
 	/* Open DRM device */
 	fd = drmOpen("rcar-du", NULL);
@@ -1343,6 +1308,7 @@ int main(int argc, char **argv)
                 "rcar-du", errno, strerror(errno));
 		return 0;
 	}
+
 	/* prepare all connectors and CRTCs */
 	ret = modeset_prepare(fd);
 	if (ret)
@@ -1357,7 +1323,17 @@ int main(int argc, char **argv)
 			fprintf(stderr, "cannot set CRTC for connector %u (%d): %m\n",
 				iter->conn, errno);
 	}
-	connect_display(format_name, "dp");
+
+	open_fb();
+	mainloop();
+	close_fb();
+
+	for (dev = 0; dev < n_devs; dev++) {
+		stop_capturing(dev);
+		uninit_device(dev);
+		close_device(dev);
+	}
+
 out_close:
 	modeset_cleanup(fd);
 	return 0;
