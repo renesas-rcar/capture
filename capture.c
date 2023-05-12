@@ -38,6 +38,8 @@
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 
+#include <linux/cmemdrv.h>
+
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 
 //#define FIELD V4L2_FIELD_INTERLACED
@@ -98,6 +100,13 @@ static struct fb_fix_screeninfo finfo;
 static long int screensize = 0;
 static char *fbmem = 0;
 static uint32_t output_fourcc = DRM_FORMAT_ABGR8888;
+
+int cmem;
+#define N_BUFFERS_MAX      32
+static char            *cmem_name[N_BUFFERS_MAX] = {"/dev/cmem0","/dev/cmem1","/dev/cmem2","/dev/cmem3","/dev/cmem4","/dev/cmem5","/dev/cmem6","/dev/cmem7",
+                                                    "/dev/cmem8","/dev/cmem9","/dev/cmem10","/dev/cmem11","/dev/cmem12","/dev/cmem13","/dev/cmem14","/dev/cmem15",
+                                                    "/dev/cmem16","/dev/cmem17","/dev/cmem18","/dev/cmem19","/dev/cmem20","/dev/cmem21","/dev/cmem22","/dev/cmem23",
+                                                    "/dev/cmem24","/dev/cmem25","/dev/cmem26","/dev/cmem27","/dev/cmem28","/dev/cmem29","/dev/cmem30","/dev/cmem31"};
 
 static void errno_exit(const char *s)
 {
@@ -162,6 +171,66 @@ static inline void yuv_to_rgb32(unsigned short y,
     *rgb++ = g; //G
     *rgb++ = r; //R
     *rgb   = 0; //A
+}
+
+void cmem_init() {
+        int ret;
+        char const rmmod_cmemdrv[14] = "rmmod cmemdrv";
+        char const *insmod_cmemdrv = "modprobe cmemdrv bsize=7833600,7833600,7833600,7833600,7833600,7833600,7833600,7833600,"
+                                                                "7833600,7833600,7833600,7833600,7833600,7833600,7833600,7833600,"
+                                                                "7833600,7833600,7833600,7833600,7833600,7833600,7833600,7833600,"
+                                                                "7833600,7833600,7833600,7833600,7833600,7833600,7833600,7833600";
+        /* Run the command (in Linux console) to remove cmem driver */
+        ret = system(rmmod_cmemdrv);
+        if (ret)
+                fprintf(stderr, "Failed to rmmod cmemdrv\n");
+        /* Run the command (in Linux console) to insert cmem driver with 32 areas*/
+        ret = system(insmod_cmemdrv);
+        if (ret)
+                fprintf(stderr, "Failed to modprobe cmemdrv\n");
+}
+
+#ifdef ENABLE_CMEM_AREA_INIT
+void cmem_area_init(int cmem_fd, void *address, size_t size)
+{
+	struct mem_mlock lock;
+
+	memset(address, 0, size);
+
+	lock.offset = 0;
+	lock.size = size;
+	lock.dir = IOCTL_FROM_CPU_TO_DEV; /* cache clean */
+	ioctl(cmem_fd, M_LOCK, (void *)&lock);
+
+	lock.dir = IOCTL_FROM_DEV_TO_CPU; /* cache invalidate */
+	ioctl(cmem_fd, M_UNLOCK, (void *)&lock);
+}
+#endif /* ENABLE_CMEM_AREA_INIT */
+
+int cmem_alloc(size_t size, off_t offset, unsigned int *phard_addr, void **puser_virt_addr) {
+        struct mem_info ioinfo;
+        unsigned int hard_addr;
+        void *virt_addr;
+
+        int cmem_fd = open(cmem_name[cmem], O_RDWR | O_SYNC);
+	if (cmem_fd < 0) {
+		return -1;
+	}
+
+        ioctl(cmem_fd, GET_PHYS_ADDR, (void *)&ioinfo);
+        hard_addr = ioinfo.phys_addr;
+        virt_addr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, cmem_fd, offset);
+
+#ifdef ENABLE_CMEM_AREA_INIT
+	cmem_area_init(cmem_fd, virt_addr, size);
+#endif /* ENABLE_CMEM_AREA_INIT */
+
+        *phard_addr = hard_addr;
+        *puser_virt_addr = virt_addr;
+
+        cmem++;
+
+        return 0;
 }
 
 static void process_image(const void *p, int size, int dev)
@@ -465,7 +534,8 @@ static void uninit_device(int dev)
 
         case IO_METHOD_USERPTR:
                 for (i = 0; i < n_buffers[dev]; ++i)
-                        free((buffers[dev])[i].start);
+                        if (-1 == munmap((buffers[dev])[i].start, (buffers[dev])[i].length))
+                                errno_exit("munmap");
                 break;
         }
 
@@ -551,6 +621,8 @@ static void init_mmap(int dev)
 static void init_userp(unsigned int buffer_size, int dev)
 {
         struct v4l2_requestbuffers req;
+        int ret;
+        unsigned int hard_addr;
 
         CLEAR(req);
 
@@ -577,7 +649,10 @@ static void init_userp(unsigned int buffer_size, int dev)
 
         for (n_buffers[dev] = 0; n_buffers[dev] < 4; ++n_buffers[dev]) {
                 (buffers[dev])[n_buffers[dev]].length = buffer_size;
-                (buffers[dev])[n_buffers[dev]].start = malloc(buffer_size);
+                ret = cmem_alloc(buffer_size, 0, &hard_addr, &(buffers[dev])[n_buffers[dev]].start);
+                fprintf(stderr, "mapping %s into buffer%d of dev%d (physical address 0x%x; vitural address 0x%lx)\n", cmem_name[cmem-1], n_buffers[dev], dev, hard_addr, (unsigned long)(buffers[dev])[n_buffers[dev]].start);
+                if (ret != 0)
+                        fprintf(stderr, "Cannot open cmem\n");
 
                 if (!(buffers[dev])[n_buffers[dev]].start) {
                         fprintf(stderr, "Out of memory\n");
@@ -1180,8 +1255,9 @@ int main(int argc, char **argv)
         dev_name[0] = "/dev/video0";
         fbdev_name = "/dev/fb0";
         format_name = "uyvy";
-		int ret, fd;
-		struct modeset_dev *iter;
+        int ret, fd;
+        struct modeset_dev *iter;
+        struct stat st;
 
         for (;;) {
                 int idx;
@@ -1294,6 +1370,20 @@ int main(int argc, char **argv)
                         exit(EXIT_FAILURE);
                 }
         }
+
+        if (io == IO_METHOD_USERPTR) {
+                if (n_devs > 8) {
+                        fprintf(stderr, "Temporarily, IO_METHOD_USERPTR mode only supports up to 8 cameras to capture simultaneously\n");
+                        return 0;
+                }
+                /* cmem initialization */
+                if (-1 == stat(cmem_name[N_BUFFERS_MAX-1], &st)) {
+                        fprintf(stderr, "Initialize cmem for IO_METHOD_USERPTR allocation\n");
+                        cmem_init();
+                }
+                cmem = 0;
+        }
+
 	/* Init Video Capture */
 	for (dev = 0; dev < n_devs; dev++) {
 		open_device(dev);

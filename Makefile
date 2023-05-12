@@ -12,6 +12,8 @@
 FLAGS=`pkg-config --cflags --libs libdrm`
 FLAGS+=-Wall -O0 -g
 
+CFLAGS+=-DENABLE_CMEM_AREA_INIT
+
 all:
 	$(CC) -o capture capture.c $(FLAGS) $(CFLAGS) $(LDFLAGS) $(LIBS)
 
