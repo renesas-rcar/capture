@@ -108,6 +108,10 @@ static char            *cmem_name[N_BUFFERS_MAX] = {"/dev/cmem0","/dev/cmem1","/
                                                     "/dev/cmem16","/dev/cmem17","/dev/cmem18","/dev/cmem19","/dev/cmem20","/dev/cmem21","/dev/cmem22","/dev/cmem23",
                                                     "/dev/cmem24","/dev/cmem25","/dev/cmem26","/dev/cmem27","/dev/cmem28","/dev/cmem29","/dev/cmem30","/dev/cmem31"};
 
+FILE *g_fp;
+unsigned char *g_dst = NULL;
+unsigned char *g_temp = NULL;
+
 static void errno_exit(const char *s)
 {
         fprintf(stderr, "%s error %d, %s\n", s, errno, strerror(errno));
@@ -233,10 +237,39 @@ int cmem_alloc(size_t size, off_t offset, unsigned int *phard_addr, void **puser
         return 0;
 }
 
+static void Conv_ARGB88882RGB888(unsigned char *argb8888, unsigned char *xrgb8888, int width, int height) {
+	int x,y;
+	unsigned char r,g,b;
+
+	//! output color data
+	for (y = 0; y < height; y++) {
+		for (x=0; x < width; x++) {
+			//A = (argb8888[3] & 0xFF);
+			r = (argb8888[2] & 0xFF);
+			g = (argb8888[1] & 0xFF);
+			b = (argb8888[0] & 0xFF);
+
+			// PPM have RGB
+			*(xrgb8888 + 0) = r;
+			*(xrgb8888 + 1) = g;
+			*(xrgb8888 + 2) = b;
+
+			argb8888 += 4;
+			xrgb8888 += 3;
+		}
+	}
+}
+
 static void process_image(const void *p, int size, int dev)
 {
-        if (out_buf)
-                fwrite(p, size, 1, stdout);
+        if (out_buf) {
+				fprintf(g_fp, "P6\n");//! type
+				fprintf(g_fp, "%d %d\n", WIDTH, HEIGHT); //! width & height
+				fprintf(g_fp, "255 ");//! tone
+
+				fprintf(stderr, "copying a ppm!\n");
+				memcpy(g_temp, p, size);
+		}
 
         if (out_fb) {
             if (!strncmp(format_name, "rgb32", 5) | !strncmp(format_name, "raw10", 5)) {
@@ -406,7 +439,7 @@ static int read_frame(int dev)
 
 static void mainloop(void)
 {
-        unsigned int count = frame_count;
+        unsigned int count = out_buf ? 1 : frame_count;
         int dev = 0;
         fd_set fds;
         struct timeval tv;
@@ -454,6 +487,7 @@ static void mainloop(void)
 static void stop_capturing(int dev)
 {
         enum v4l2_buf_type type;
+		int g_size = (WIDTH * HEIGHT) * 3;
 
         switch (io) {
         case IO_METHOD_READ:
@@ -467,12 +501,41 @@ static void stop_capturing(int dev)
                         errno_exit("VIDIOC_STREAMOFF");
                 break;
         }
+
+		if (out_buf) {
+				Conv_ARGB88882RGB888(g_temp, g_dst, WIDTH, HEIGHT);
+
+				fprintf(stderr, "writing a ppm!\n");
+				fwrite(g_dst, sizeof(unsigned char), g_size, g_fp);
+				fflush (g_fp);
+
+				fprintf(stderr, "close a ppm!\n");
+				if (g_dst)
+					free(g_dst);
+				if (g_temp)
+					free(g_temp);
+				fclose(g_fp);
+		}
 }
 
 static void start_capturing(int dev)
 {
         unsigned int i;
         enum v4l2_buf_type type;
+
+		if (out_buf) {
+			char filename[50] = "capture.ppm";
+			int g_srcsize;
+			int g_size;
+
+			//snprintf(filename, FILENAME_LEN, "capture.ppm");
+			g_srcsize = (WIDTH * HEIGHT) * 4; // assume bpp = 32
+			g_size = (WIDTH * HEIGHT) * 3; // 3?
+
+			g_fp = fopen(filename, "wb");
+			g_dst = (unsigned char *)malloc(sizeof(unsigned char) * g_size);
+			g_temp = (unsigned char *)malloc(sizeof(unsigned char) * g_srcsize);
+		}
 
         switch (io) {
         case IO_METHOD_READ:
@@ -1255,7 +1318,7 @@ int main(int argc, char **argv)
         dev_name[0] = "/dev/video0";
         fbdev_name = "/dev/fb0";
         format_name = "uyvy";
-        int ret, fd;
+        int ret, fd = 0;
         struct modeset_dev *iter;
         struct stat st;
 
@@ -1371,6 +1434,9 @@ int main(int argc, char **argv)
                 }
         }
 
+		/* Temporarily, writing to ppm function only support 1 device */
+		n_devs = out_buf ? 1 : n_devs;
+
         if (io == IO_METHOD_USERPTR) {
                 if (n_devs > 8) {
                         fprintf(stderr, "Temporarily, IO_METHOD_USERPTR mode only supports up to 8 cameras to capture simultaneously\n");
@@ -1391,27 +1457,29 @@ int main(int argc, char **argv)
 		start_capturing(dev);
 	}
 
-	/* Open DRM device */
-	fd = drmOpen("rcar-du", NULL);
-	if (fd < 0) {
-        fprintf(stderr, "Cannot open '%s': %d, %s\n",
-                "rcar-du", errno, strerror(errno));
-		return 0;
-	}
+	if (out_fb) {
+		/* Open DRM device */
+		fd = drmOpen("rcar-du", NULL);
+		if (fd < 0) {
+			fprintf(stderr, "Cannot open '%s': %d, %s\n",
+					"rcar-du", errno, strerror(errno));
+			return 0;
+		}
 
-	/* prepare all connectors and CRTCs */
-	ret = modeset_prepare(fd);
-	if (ret)
-		goto out_close;
-
-	/* perform actual modesetting on each found connector+CRTC */
-	for (iter = modeset_list; iter; iter = iter->next) {
-		iter->saved_crtc = drmModeGetCrtc(fd, iter->crtc);
-		ret = drmModeSetCrtc(fd, iter->crtc, iter->fb, 0, 0,
-				     &iter->conn, 1, &iter->mode);
+		/* prepare all connectors and CRTCs */
+		ret = modeset_prepare(fd);
 		if (ret)
-			fprintf(stderr, "cannot set CRTC for connector %u (%d): %m\n",
-				iter->conn, errno);
+			goto out_close;
+
+		/* perform actual modesetting on each found connector+CRTC */
+		for (iter = modeset_list; iter; iter = iter->next) {
+			iter->saved_crtc = drmModeGetCrtc(fd, iter->crtc);
+			ret = drmModeSetCrtc(fd, iter->crtc, iter->fb, 0, 0,
+						&iter->conn, 1, &iter->mode);
+			if (ret)
+				fprintf(stderr, "cannot set CRTC for connector %u (%d): %m\n",
+					iter->conn, errno);
+		}
 	}
 
 	open_fb();
@@ -1425,6 +1493,7 @@ int main(int argc, char **argv)
 	}
 
 out_close:
-	modeset_cleanup(fd);
+	if (out_fb)
+		modeset_cleanup(fd);
 	return 0;
 }
