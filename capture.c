@@ -263,12 +263,47 @@ static void Conv_ARGB88882RGB888(unsigned char *argb8888, unsigned char *xrgb888
 static void process_image(const void *p, int size, int dev)
 {
         if (out_buf) {
-				fprintf(g_fp, "P6\n");//! type
-				fprintf(g_fp, "%d %d\n", WIDTH, HEIGHT); //! width & height
-				fprintf(g_fp, "255 ");//! tone
+				char *buf = (char *)p;
+				int g_srcsize = 0;
 
-				fprintf(stderr, "copying a ppm!\n");
-				memcpy(g_temp, p, size);
+				if (!strncmp(format_name, "rgb32", 5)) {
+					g_srcsize = (WIDTH * HEIGHT) * 4;
+					fprintf(g_fp, "P6\n");//! type
+					fprintf(g_fp, "%d %d\n", WIDTH, HEIGHT); //! width & height
+					fprintf(g_fp, "255 ");//! tone
+
+					fprintf(stderr, "copying a ppm!\n");
+					memcpy(g_temp, buf, size);
+
+					Conv_ARGB88882RGB888(g_temp, g_dst, WIDTH, HEIGHT);
+
+					fprintf(stderr, "writing a ppm!\n");
+					fwrite(g_dst, sizeof(unsigned char), g_srcsize, g_fp);
+					fflush (g_fp);
+
+					if (g_dst)
+						free(g_dst);
+					if (g_temp)
+						free(g_temp);
+					fclose(g_fp);
+
+				} else if (!strncmp(format_name, "raw10", 5)) {
+					g_srcsize = (WIDTH * HEIGHT) * 2;
+
+					fprintf(stderr, "copying a raw!\n");
+					memcpy(g_temp, buf, size);
+
+					fprintf(stderr, "writing a raw!\n");
+					fwrite(g_temp, sizeof(unsigned char), g_srcsize, g_fp);
+					fflush (g_fp);
+
+					if (g_temp)
+						free(g_temp);
+					fclose(g_fp);
+				}
+				else {
+					fprintf(stderr, "format not supported to output to file\n");
+				}
 		}
 
         if (out_fb) {
@@ -349,10 +384,34 @@ static void process_image(const void *p, int size, int dev)
         }
 }
 
-static int read_frame(int dev)
+static int read_frame(int dev, int count)
 {
         struct v4l2_buffer buf;
         unsigned int i;
+
+		if (out_buf) {
+			char filename[50];
+			int g_size = (WIDTH * HEIGHT) * 3;
+			int g_srcsize = 0;
+
+			if (!strncmp(format_name, "rgb32", 5)) {
+				g_srcsize = (WIDTH * HEIGHT) * 4;
+				snprintf(filename, 50, "capture_frame%d.ppm", count);
+
+			} else if (!strncmp(format_name, "raw10", 5)) {
+				g_srcsize = (WIDTH * HEIGHT) * 2;
+				snprintf(filename, 50, "capture_frame%d.raw", count);
+			}
+			else {
+				fprintf(stderr, "format not supported to output to file\n");
+			}
+
+			fprintf(stderr, "File name: %s\n", filename);
+
+			g_fp = fopen(filename, "wb");
+			g_dst = (unsigned char *)malloc(sizeof(unsigned char) * g_size);
+			g_temp = (unsigned char *)malloc(sizeof(unsigned char) * g_srcsize);
+		}
 
         switch (io) {
         case IO_METHOD_READ:
@@ -439,7 +498,7 @@ static int read_frame(int dev)
 
 static void mainloop(void)
 {
-        unsigned int count = out_buf ? 1 : frame_count;
+        unsigned int count = frame_count;
         int dev = 0;
         fd_set fds;
         struct timeval tv;
@@ -474,7 +533,7 @@ static void mainloop(void)
                         r = 0;
                         for (dev = 0; dev < n_devs; dev++) {
                                 if (FD_ISSET(fd[dev], &fds))
-                                        r += read_frame(dev);
+                                        r += read_frame(dev, frame_count - count);
 //                                        usleep(30000);
                         }
                         if (r)
@@ -487,7 +546,6 @@ static void mainloop(void)
 static void stop_capturing(int dev)
 {
         enum v4l2_buf_type type;
-		int g_size = (WIDTH * HEIGHT) * 3;
 
         switch (io) {
         case IO_METHOD_READ:
@@ -501,41 +559,12 @@ static void stop_capturing(int dev)
                         errno_exit("VIDIOC_STREAMOFF");
                 break;
         }
-
-		if (out_buf) {
-				Conv_ARGB88882RGB888(g_temp, g_dst, WIDTH, HEIGHT);
-
-				fprintf(stderr, "writing a ppm!\n");
-				fwrite(g_dst, sizeof(unsigned char), g_size, g_fp);
-				fflush (g_fp);
-
-				fprintf(stderr, "close a ppm!\n");
-				if (g_dst)
-					free(g_dst);
-				if (g_temp)
-					free(g_temp);
-				fclose(g_fp);
-		}
 }
 
 static void start_capturing(int dev)
 {
         unsigned int i;
         enum v4l2_buf_type type;
-
-		if (out_buf) {
-			char filename[50] = "capture.ppm";
-			int g_srcsize;
-			int g_size;
-
-			//snprintf(filename, FILENAME_LEN, "capture.ppm");
-			g_srcsize = (WIDTH * HEIGHT) * 4; // assume bpp = 32
-			g_size = (WIDTH * HEIGHT) * 3; // 3?
-
-			g_fp = fopen(filename, "wb");
-			g_dst = (unsigned char *)malloc(sizeof(unsigned char) * g_size);
-			g_temp = (unsigned char *)malloc(sizeof(unsigned char) * g_srcsize);
-		}
 
         switch (io) {
         case IO_METHOD_READ:
