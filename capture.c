@@ -79,6 +79,7 @@ static struct modeset_dev *modeset_list = NULL;
 static char             n_devs = 1;
 static char            *dev_name[N_DEVS_MAX] = {"/dev/video0","/dev/video1","/dev/video2","/dev/video3","/dev/video4","/dev/video5","/dev/video6","/dev/video7","/dev/video8","/dev/video9","/dev/video10","/dev/video11"};
 static char            *fbdev_name;
+static char            *drmdev_name;
 static enum io_method   io = IO_METHOD_MMAP;
 //static enum io_method   io = IO_METHOD_USERPTR;
 static int              fd[N_DEVS_MAX] = {-1, -1, -1, -1, -1, -1, -1, -1};
@@ -396,11 +397,11 @@ static int read_frame(int dev, int count)
 
 			if (!strncmp(format_name, "rgb32", 5)) {
 				g_srcsize = (WIDTH * HEIGHT) * 4;
-				snprintf(filename, 50, "capture_frame%d.ppm", count);
+				snprintf(filename, 50, "cap_%s_l%d_t%d_%dx%d_frame%d.ppm", format_name, LEFT, TOP, WIDTH, HEIGHT, count);
 
 			} else if (!strncmp(format_name, "raw10", 5)) {
 				g_srcsize = (WIDTH * HEIGHT) * 2;
-				snprintf(filename, 50, "capture_frame%d.raw", count);
+				snprintf(filename, 50, "cap_%s_l%d_t%d_%dx%d_frame%d.raw", format_name, LEFT, TOP, WIDTH, HEIGHT, count);
 			}
 			else {
 				fprintf(stderr, "format not supported to output to file\n");
@@ -1303,7 +1304,7 @@ static void usage(FILE *fp, char **argv)
                  "-r | --read          Use read() calls\n"
                  "-u | --userp         Use application allocated buffers\n"
                  "-o | --output        Outputs stream to stdout\n"
-                 "-F | --output_fb     Outputs stream to framebuffer\n"
+                 "-F | --output_fb     Outputs stream to framebuffer: rcar-du, rcar-vcon [%s]\n"
                  "-f | --format        Set pixel format: raw10, uyvy, yuyv, rgb565, rgb32, nv12, nv16, bggr8, grey [%s]\n"
                  "-c | --count         Number of frames to grab [%i]\n"
                  "-z | --fps_count     Enable fps show\n"
@@ -1314,10 +1315,10 @@ static void usage(FILE *fp, char **argv)
                  "-H | --height        Video height [%i]\n"
                  "-t | --timeout       Select timeout [%i]sec\n"
                  "",
-                 argv[0], dev_name[0], n_devs, format_name, frame_count, LEFT, TOP, WIDTH, HEIGHT, timeout);
+                 argv[0], dev_name[0], n_devs, drmdev_name, format_name, frame_count, LEFT, TOP, WIDTH, HEIGHT, timeout);
 }
 
-static const char short_options[] = "d:D:hmruoFf:c:zs:L:T:W:H:t:";
+static const char short_options[] = "d:D:hmruoF:f:c:zs:L:T:W:H:t:";
 
 static const struct option
 long_options[] = {
@@ -1328,7 +1329,7 @@ long_options[] = {
         { "read",   no_argument,       NULL, 'r' },
         { "userp",  no_argument,       NULL, 'u' },
         { "output", no_argument,       NULL, 'o' },
-        { "output_fb", no_argument,    NULL, 'F' },
+        { "output_fb", required_argument,      NULL, 'F' },
         { "format", required_argument, NULL, 'f' },
         { "count",  required_argument, NULL, 'c' },
         { "fps_count",  required_argument, NULL, 'z' },
@@ -1347,6 +1348,7 @@ int main(int argc, char **argv)
         dev_name[0] = "/dev/video0";
         fbdev_name = "/dev/fb0";
         format_name = "uyvy";
+        drmdev_name = "rcar-du";
         int ret, fd = 0;
         struct modeset_dev *iter;
         struct stat st;
@@ -1398,6 +1400,7 @@ int main(int argc, char **argv)
 
                 case 'F':
                         out_fb++;
+						drmdev_name = optarg;
                         break;
 
                 case 'f':
@@ -1488,10 +1491,10 @@ int main(int argc, char **argv)
 
 	if (out_fb) {
 		/* Open DRM device */
-		fd = drmOpen("rcar-du", NULL);
+		fd = drmOpen(drmdev_name, NULL);
 		if (fd < 0) {
 			fprintf(stderr, "Cannot open '%s': %d, %s\n",
-					"rcar-du", errno, strerror(errno));
+					drmdev_name, errno, strerror(errno));
 			return 0;
 		}
 
