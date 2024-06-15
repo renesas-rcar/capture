@@ -101,6 +101,7 @@ static struct fb_fix_screeninfo finfo;
 static long int screensize = 0;
 static char *fbmem = 0;
 static uint32_t output_fourcc = DRM_FORMAT_ABGR8888;
+static int start_dev = 0;
 
 int cmem;
 #define N_BUFFERS_MAX	   32
@@ -141,15 +142,16 @@ static void fpsCount(int dev)
 	static struct timeval frame_time[N_DEVS_MAX];
 	static unsigned long usec[N_DEVS_MAX];
 	struct timeval t;
+	int index = dev - start_dev;
 
 	gettimeofday(&t, NULL);
-	usec[dev] += frames[dev]++ ? uSecElapsed(&t, &frame_time[dev]) : 0;
-	frame_time[dev] = t;
-	if (usec[dev] >= 1000000) {
-		unsigned fps = ((unsigned long long)frames[dev] * 10000000 + usec[dev] - 1) / usec[dev];
+	usec[index] += frames[index]++ ? uSecElapsed(&t, &frame_time[index]) : 0;
+	frame_time[index] = t;
+	if (usec[index] >= 1000000) {
+		unsigned fps = ((unsigned long long)frames[index] * 10000000 + usec[index] - 1) / usec[index];
 		fprintf(stderr, "%s FPS: %3u.%1u\n", dev_name[dev], fps / 10, fps % 10);
-		usec[dev] = 0;
-		frames[dev] = 0;
+		usec[index] = 0;
+		frames[index] = 0;
 	}
 }
 
@@ -263,6 +265,8 @@ static void Conv_ARGB88882RGB888(unsigned char *argb8888, unsigned char *xrgb888
 
 static void process_image(const void *p, int size, int dev)
 {
+	int index = dev - start_dev;
+
 	if (out_buf) {
 		char *buf = (char *)p;
 		int g_srcsize = 0;
@@ -309,7 +313,7 @@ static void process_image(const void *p, int size, int dev)
 	if (out_fb) {
 		if (!strncmp(format_name, "rgb32", 5) | !strncmp(format_name, "raw10", 5)) {
 			int i;
-			int offset = (WIDTH*4)*(dev%(n_devs > 4 ? 4 : 2)) + (HEIGHT*modeset_list->stride)*(dev/(n_devs > 4 ? 4 : 2));
+			int offset = (WIDTH*4)*(index%(n_devs > 4 ? 4 : 2)) + (HEIGHT*modeset_list->stride)*(index/(n_devs > 4 ? 4 : 2));
 			unsigned char *fbp = (unsigned char *)modeset_list->map + offset;
 			char *buf = (char *)p;
 
@@ -388,6 +392,7 @@ static int read_frame(int dev, int count)
 {
 	struct v4l2_buffer buf;
 	unsigned int i;
+	int index = dev - start_dev;
 
 	if (out_buf) {
 		char filename[50];
@@ -415,7 +420,7 @@ static int read_frame(int dev, int count)
 
 	switch (io) {
 		case IO_METHOD_READ:
-			if (-1 == read(fd[dev], (buffers[dev])[0].start, (buffers[dev])[0].length)) {
+			if (-1 == read(fd[dev], (buffers[index])[0].start, (buffers[index])[0].length)) {
 				switch (errno) {
 					case EAGAIN:
 						return 0;
@@ -427,7 +432,7 @@ static int read_frame(int dev, int count)
 				}
 			}
 
-			process_image((buffers[dev])[0].start, (buffers[dev])[0].length, dev);
+			process_image((buffers[index])[0].start, (buffers[index])[0].length, dev);
 			break;
 
 		case IO_METHOD_MMAP:
@@ -448,9 +453,9 @@ static int read_frame(int dev, int count)
 				}
 			}
 
-			assert(buf.index < n_buffers[dev]);
+			assert(buf.index < n_buffers[index]);
 
-			process_image((buffers[dev])[buf.index].start, buf.bytesused, dev);
+			process_image((buffers[index])[buf.index].start, buf.bytesused, dev);
 
 			if (-1 == xioctl(fd[dev], VIDIOC_QBUF, &buf))
 				errno_exit("VIDIOC_QBUF");
@@ -474,12 +479,12 @@ static int read_frame(int dev, int count)
 				}
 			}
 
-			for (i = 0; i < n_buffers[dev]; ++i)
-				if (buf.m.userptr == (unsigned long)(buffers[dev])[i].start
-					&& buf.length == (buffers[dev])[i].length)
+			for (i = 0; i < n_buffers[index]; ++i)
+				if (buf.m.userptr == (unsigned long)(buffers[index])[i].start
+					&& buf.length == (buffers[index])[i].length)
 					break;
 
-			assert(i < n_buffers[dev]);
+			assert(i < n_buffers[index]);
 
 			process_image((void *)buf.m.userptr, buf.bytesused, dev);
 
@@ -496,7 +501,7 @@ static int read_frame(int dev, int count)
 
 #define max(a,b) (a>b?a:b)
 
-static void mainloop(void)
+static void mainloop(int start_dev)
 {
 	unsigned int count = frame_count;
 	int dev = 0;
@@ -511,7 +516,7 @@ static void mainloop(void)
 		for (;;) {
 			FD_ZERO(&fds);
 
-			for (dev = 0; dev < n_devs; dev++)
+			for (dev = start_dev; dev < start_dev+n_devs; dev++)
 				FD_SET(fd[dev], &fds);
 			/* Timeout. */
 			tv.tv_sec = timeout;
@@ -531,7 +536,7 @@ static void mainloop(void)
 			}
 
 			r = 0;
-			for (dev = 0; dev < n_devs; dev++) {
+			for (dev = start_dev; dev < start_dev+n_devs; dev++) {
 				if (FD_ISSET(fd[dev], &fds))
 					r += read_frame(dev, frame_count - count);
 //					  usleep(30000);
@@ -565,6 +570,7 @@ static void start_capturing(int dev)
 {
 	unsigned int i;
 	enum v4l2_buf_type type;
+	int index = dev - start_dev;
 
 	switch (io) {
 		case IO_METHOD_READ:
@@ -572,7 +578,7 @@ static void start_capturing(int dev)
 			break;
 
 		case IO_METHOD_MMAP:
-			for (i = 0; i < n_buffers[dev]; ++i) {
+			for (i = 0; i < n_buffers[index]; ++i) {
 				struct v4l2_buffer buf;
 
 				CLEAR(buf);
@@ -589,15 +595,15 @@ static void start_capturing(int dev)
 			break;
 
 		case IO_METHOD_USERPTR:
-			for (i = 0; i < n_buffers[dev]; ++i) {
+			for (i = 0; i < n_buffers[index]; ++i) {
 				struct v4l2_buffer buf;
 
 				CLEAR(buf);
 				buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 				buf.memory = V4L2_MEMORY_USERPTR;
 				buf.index = i;
-				buf.m.userptr = (unsigned long)(buffers[dev])[i].start;
-				buf.length = (buffers[dev])[i].length;
+				buf.m.userptr = (unsigned long)(buffers[index])[i].start;
+				buf.length = (buffers[index])[i].length;
 
 				if (-1 == xioctl(fd[dev], VIDIOC_QBUF, &buf))
 					errno_exit("VIDIOC_QBUF");
@@ -612,41 +618,43 @@ static void start_capturing(int dev)
 static void uninit_device(int dev)
 {
 	unsigned int i;
+	int index = dev - start_dev;
 
 	switch (io) {
 		case IO_METHOD_READ:
-			free((buffers[dev])[0].start);
+			free((buffers[index])[0].start);
 			break;
 
 		case IO_METHOD_MMAP:
-			for (i = 0; i < n_buffers[dev]; ++i)
-				if (-1 == munmap((buffers[dev])[i].start, (buffers[dev])[i].length))
+			for (i = 0; i < n_buffers[index]; ++i)
+				if (-1 == munmap((buffers[index])[i].start, (buffers[index])[i].length))
 					errno_exit("munmap");
 			break;
 
 		case IO_METHOD_USERPTR:
-			for (i = 0; i < n_buffers[dev]; ++i)
-				if (-1 == munmap((buffers[dev])[i].start, (buffers[dev])[i].length))
+			for (i = 0; i < n_buffers[index]; ++i)
+				if (-1 == munmap((buffers[index])[i].start, (buffers[index])[i].length))
 					errno_exit("munmap");
 			break;
 	}
 
-	free(buffers[dev]);
+	free(buffers[index]);
 }
 
 static void init_read(unsigned int buffer_size, int dev)
 {
-	buffers[dev] = calloc(1, sizeof(*buffers[dev]));
+	int index = dev - start_dev;
+	buffers[index] = calloc(1, sizeof(*buffers[index]));
 
-	if (!buffers[dev]) {
+	if (!buffers[index]) {
 		fprintf(stderr, "Out of memory\n");
 		exit(EXIT_FAILURE);
 	}
 
-	(buffers[dev])[0].length = buffer_size;
-	(buffers[dev])[0].start = malloc(sizeof(unsigned char) * buffer_size);
+	(buffers[index])[0].length = buffer_size;
+	(buffers[index])[0].start = malloc(sizeof(unsigned char) * buffer_size);
 
-	if (!(buffers[dev])[0].start) {
+	if (!(buffers[index])[0].start) {
 		fprintf(stderr, "Out of memory\n");
 		exit(EXIT_FAILURE);
 	}
@@ -655,6 +663,7 @@ static void init_read(unsigned int buffer_size, int dev)
 static void init_mmap(int dev)
 {
 	struct v4l2_requestbuffers req;
+	int index = dev - start_dev;
 
 	CLEAR(req);
 
@@ -678,34 +687,34 @@ static void init_mmap(int dev)
 		exit(EXIT_FAILURE);
 	}
 
-	buffers[dev] = calloc(req.count, sizeof(*buffers[dev]));
+	buffers[index] = calloc(req.count, sizeof(*buffers[index]));
 
-	if (!buffers[dev]) {
+	if (!buffers[index]) {
 		fprintf(stderr, "Out of memory\n");
 		exit(EXIT_FAILURE);
 	}
 
-	for (n_buffers[dev] = 0; n_buffers[dev] < req.count; ++n_buffers[dev]) {
+	for (n_buffers[index] = 0; n_buffers[index] < req.count; ++n_buffers[index]) {
 		struct v4l2_buffer buf;
 
 		CLEAR(buf);
 
 		buf.type	= V4L2_BUF_TYPE_VIDEO_CAPTURE;
 		buf.memory	= V4L2_MEMORY_MMAP;
-		buf.index	= n_buffers[dev];
+		buf.index	= n_buffers[index];
 
 		if (-1 == xioctl(fd[dev], VIDIOC_QUERYBUF, &buf))
 			errno_exit("VIDIOC_QUERYBUF");
 
-		(buffers[dev])[n_buffers[dev]].length = buf.length;
-		(buffers[dev])[n_buffers[dev]].start =
+		(buffers[index])[n_buffers[index]].length = buf.length;
+		(buffers[index])[n_buffers[index]].start =
 			mmap(NULL /* start anywhere */,
 				  buf.length,
 				  PROT_READ | PROT_WRITE /* required */,
 				  MAP_SHARED /* recommended */,
 				  fd[dev], buf.m.offset);
 
-		if (MAP_FAILED == (buffers[dev])[n_buffers[dev]].start)
+		if (MAP_FAILED == (buffers[index])[n_buffers[index]].start)
 			errno_exit("mmap");
 	}
 }
@@ -715,6 +724,7 @@ static void init_userp(unsigned int buffer_size, int dev)
 	struct v4l2_requestbuffers req;
 	int ret;
 	unsigned int hard_addr;
+	int index = dev - start_dev;
 
 	CLEAR(req);
 
@@ -732,21 +742,21 @@ static void init_userp(unsigned int buffer_size, int dev)
 		}
 	}
 
-	buffers[dev] = calloc(4, sizeof(*buffers[dev]));
+	buffers[index] = calloc(4, sizeof(*buffers[index]));
 
-	if (!buffers[dev]) {
+	if (!buffers[index]) {
 		fprintf(stderr, "Out of memory\n");
 		exit(EXIT_FAILURE);
 	}
 
-	for (n_buffers[dev] = 0; n_buffers[dev] < 4; ++n_buffers[dev]) {
-		(buffers[dev])[n_buffers[dev]].length = buffer_size;
-		ret = cmem_alloc(buffer_size, 0, &hard_addr, &(buffers[dev])[n_buffers[dev]].start);
-		fprintf(stderr, "mapping %s into buffer%d of dev%d (physical address 0x%x; vitural address 0x%lx)\n", cmem_name[cmem-1], n_buffers[dev], dev, hard_addr, (unsigned long)(buffers[dev])[n_buffers[dev]].start);
+	for (n_buffers[index] = 0; n_buffers[index] < 4; ++n_buffers[index]) {
+		(buffers[index])[n_buffers[index]].length = buffer_size;
+		ret = cmem_alloc(buffer_size, 0, &hard_addr, &(buffers[index])[n_buffers[index]].start);
+		fprintf(stderr, "mapping %s into buffer%d of dev%d (physical address 0x%x; vitural address 0x%lx)\n", cmem_name[cmem-1], n_buffers[index], dev, hard_addr, (unsigned long)(buffers[index])[n_buffers[index]].start);
 		if (ret != 0)
 			fprintf(stderr, "Cannot open cmem\n");
 
-		if (!(buffers[dev])[n_buffers[dev]].start) {
+		if (!(buffers[index])[n_buffers[index]].start) {
 			fprintf(stderr, "Out of memory\n");
 			exit(EXIT_FAILURE);
 		}
@@ -1341,6 +1351,17 @@ long_options[] = {
 	{ 0, 0, 0, 0 }
 };
 
+int extractNumber(const char* str) {
+	const char* ptr = str;
+	while (*ptr) {
+		if (*ptr >= '0' && *ptr <= '9') {
+			return atoi(ptr);
+		}
+		ptr++;
+	}
+	return -1;	// Return -1 if no number is found
+}
+
 int main(int argc, char **argv)
 {
 	int dev;
@@ -1368,6 +1389,7 @@ int main(int argc, char **argv)
 
 		case 'd':
 			dev_name[0] = optarg;
+			start_dev = extractNumber(optarg);
 			break;
 
 		case 'D':
@@ -1482,7 +1504,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Init Video Capture */
-	for (dev = 0; dev < n_devs; dev++) {
+	for (dev = start_dev; dev < start_dev+n_devs; dev++) {
 		open_device(dev);
 		init_device(dev);
 		start_capturing(dev);
@@ -1514,10 +1536,10 @@ int main(int argc, char **argv)
 	}
 
 	open_fb();
-	mainloop();
+	mainloop(start_dev);
 	close_fb();
 
-	for (dev = 0; dev < n_devs; dev++) {
+	for (dev = start_dev; dev < start_dev+n_devs; dev++) {
 		stop_capturing(dev);
 		uninit_device(dev);
 		close_device(dev);
