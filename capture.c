@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <time.h>
 
 #include <getopt.h>		/* getopt_long() */
 
@@ -395,17 +396,20 @@ static int read_frame(int dev, int count)
 	int index = dev - start_dev;
 
 	if (out_buf) {
-		char filename[50];
+		char filename[60];
 		int g_size = (WIDTH * HEIGHT) * 3;
 		int g_srcsize = 0;
+		time_t current_time = 0;
+
+		time(&current_time);
 
 		if (!strncmp(format_name, "rgb32", 5)) {
 			g_srcsize = (WIDTH * HEIGHT) * 4;
-			snprintf(filename, 50, "cap_%s_l%d_t%d_%dx%d_frame%d.ppm", format_name, LEFT, TOP, WIDTH, HEIGHT, count);
+			snprintf(filename, 60, "cap_%ld_video%d_%s_l%d_t%d_%dx%d_frame%d.ppm", current_time, dev, format_name, LEFT, TOP, WIDTH, HEIGHT, count);
 
 		} else if (!strncmp(format_name, "raw10", 5)) {
 			g_srcsize = (WIDTH * HEIGHT) * 2;
-			snprintf(filename, 50, "cap_%s_l%d_t%d_%dx%d_frame%d.raw", format_name, LEFT, TOP, WIDTH, HEIGHT, count);
+			snprintf(filename, 60, "cap_%ld_video%d_%s_l%d_t%d_%dx%d_frame%d.raw", current_time, dev, format_name, LEFT, TOP, WIDTH, HEIGHT, count);
 		}
 		else {
 			fprintf(stderr, "format not supported to output to file\n");
