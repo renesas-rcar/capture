@@ -76,14 +76,14 @@ struct modeset_dev {
 
 static struct modeset_dev *modeset_list = NULL;
 
-#define N_DEVS_MAX	12
+#define N_DEVS_MAX	16
 static char		n_devs = 1;
-static char		   *dev_name[N_DEVS_MAX] = {"/dev/video0","/dev/video1","/dev/video2","/dev/video3","/dev/video4","/dev/video5","/dev/video6","/dev/video7","/dev/video8","/dev/video9","/dev/video10","/dev/video11"};
+static char		   *dev_name[N_DEVS_MAX] = {"/dev/video0","/dev/video1","/dev/video2","/dev/video3","/dev/video4","/dev/video5","/dev/video6","/dev/video7","/dev/video8","/dev/video9","/dev/video10","/dev/video11","/dev/video12","/dev/video13","/dev/video14","/dev/video15"};
 static char		   *fbdev_name;
 static char		   *drmdev_name;
 static enum io_method	io = IO_METHOD_MMAP;
 //static enum io_method	  io = IO_METHOD_USERPTR;
-static int		fd[N_DEVS_MAX] = {-1, -1, -1, -1, -1, -1, -1, -1};
+static int		fd[N_DEVS_MAX] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
 static int		fbfd = -1;
 struct buffer	   *buffers[N_DEVS_MAX];
 static unsigned int	n_buffers[N_DEVS_MAX];
@@ -526,7 +526,7 @@ static void mainloop(int start_dev)
 			tv.tv_sec = timeout;
 			tv.tv_usec = 0;
 
-			r = select(max(max(max(max(fd[0],fd[1]),max(fd[2],fd[3])),max(max(fd[4],fd[5]),max(fd[6],fd[7]))),max(max(fd[8],fd[9]),max(fd[10],fd[11]))) + 1, &fds, NULL, NULL, &tv);
+			r = select(max(max(max(max(fd[0],fd[1]), max(fd[2],fd[3])), max(max(fd[4],fd[5]), max(fd[6],fd[7]))), max(max(max(fd[8],fd[9]), max(fd[10],fd[11])), max(max(fd[12],fd[13]), max(fd[14],fd[15])))) + 1, &fds, NULL, NULL, &tv);
 //			  r = select((max(max(max(fd[0],fd[1]),max(fd[2],fd[3])),max(max(fd[4],fd[5]),max(fd[6],fd[7]))),max(max(fd[8],fd[9]),max(fd[10],fd[11]))) + 1, &fds, NULL, NULL, &tv);
 			if (-1 == r) {
 				if (EINTR == errno)
