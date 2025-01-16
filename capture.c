@@ -887,7 +887,7 @@ static void init_dmabuf(int dev)
 	struct v4l2_requestbuffers rqbufs;
 
 	/* request buffers from v4l2 device */
-	memset(&rqbufs, 0, sizeof(rqbufs));
+	CLEAR(rqbufs);
 	rqbufs.count = 7;
 	rqbufs.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	rqbufs.memory = V4L2_MEMORY_DMABUF;
