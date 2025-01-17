@@ -41,6 +41,9 @@
 
 #include <linux/cmemdrv.h>
 
+#include <linux/dma-buf.h>
+#include <linux/dma-heap.h>
+
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 
 //#define FIELD V4L2_FIELD_INTERLACED
@@ -50,11 +53,13 @@ enum io_method {
 	IO_METHOD_READ,
 	IO_METHOD_MMAP,
 	IO_METHOD_USERPTR,
+	IO_METHOD_DMABUF
 };
 
 struct buffer {
 	void   *start;
 	size_t	length;
+	int fd; // dmabuf file descriptor
 };
 
 struct modeset_dev {
@@ -85,9 +90,10 @@ static enum io_method	io = IO_METHOD_MMAP;
 //static enum io_method	  io = IO_METHOD_USERPTR;
 static int		fd[N_DEVS_MAX] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
 static int		fbfd = -1;
+static int dmabuf_heap_fd = -1;
 struct buffer	   *buffers[N_DEVS_MAX];
 static unsigned int	n_buffers[N_DEVS_MAX];
-static int		out_buf, out_fb;
+static int		out_buf = 0, out_fb = 0;
 static char		*format_name;
 static int		frame_count = 70;
 static int		fps_count = 0;
@@ -241,6 +247,58 @@ int cmem_alloc(size_t size, off_t offset, unsigned int *phard_addr, void **puser
 	return 0;
 }
 
+static int dmabuf_heap_open()
+{
+	int i;
+	static const char *heap_names[] = { "/dev/dma_heap/linux,cma", "/dev/dma_heap/reserved" };
+
+	for(i = 0; i < 2; i++)
+	{
+		int fd = open(heap_names[i], O_RDWR, 0);
+
+		if(fd >= 0)
+			return fd;
+	}
+
+	return -1;
+}
+
+static void dmabuf_heap_close(int heap_fd)
+{
+	close(heap_fd);
+}
+
+static int dmabuf_heap_alloc(int heap_fd, const char *name, size_t size)
+{
+	struct dma_heap_allocation_data alloc = { 0 };
+
+	alloc.len = size;
+	alloc.fd_flags = O_CLOEXEC | O_RDWR;
+
+	if(ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &alloc) < 0)
+		return -1;
+
+	if(name)
+		ioctl(alloc.fd, DMA_BUF_SET_NAME, name);
+
+	return alloc.fd;
+}
+
+static int dmabuf_sync(int buf_fd, bool start)
+{
+	struct dma_buf_sync sync = { 0 };
+
+	sync.flags = (start ? DMA_BUF_SYNC_START : DMA_BUF_SYNC_END) | DMA_BUF_SYNC_RW;
+
+	do
+	{
+		if(ioctl(buf_fd, DMA_BUF_IOCTL_SYNC, &sync) == 0)
+			return 0;
+	} while((errno == EINTR) || (errno == EAGAIN));
+
+	return -1;
+}
+
 static void Conv_ARGB88882RGB888(unsigned char *argb8888, unsigned char *xrgb8888, int width, int height) {
 	int x,y;
 	unsigned char r,g,b;
@@ -273,7 +331,7 @@ static void process_image(const void *p, int size, int dev)
 		int g_srcsize = 0;
 
 		if (!strncmp(format_name, "rgb32", 5)) {
-			g_srcsize = (WIDTH * HEIGHT) * 4;
+			g_srcsize = (WIDTH * HEIGHT) * 3;
 			fprintf(g_fp, "P6\n");//! type
 			fprintf(g_fp, "%d %d\n", WIDTH, HEIGHT); //! width & height
 			fprintf(g_fp, "255 ");//! tone
@@ -394,6 +452,7 @@ static int read_frame(int dev, int count)
 	struct v4l2_buffer buf;
 	unsigned int i;
 	int index = dev - start_dev;
+	int buf_index;
 
 	if (out_buf) {
 		char filename[60];
@@ -495,6 +554,31 @@ static int read_frame(int dev, int count)
 			if (-1 == xioctl(fd[dev], VIDIOC_QBUF, &buf))
 				errno_exit("VIDIOC_QBUF");
 			break;
+		case IO_METHOD_DMABUF:
+			CLEAR(buf);
+
+			/* dequeue a buffer */
+			buf.memory = V4L2_MEMORY_DMABUF;
+			buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+			if (-1 == xioctl(fd[dev], VIDIOC_DQBUF, &buf))
+				errno_exit("VIDIOC_DQBUF");
+
+			buf_index = buf.index;
+
+			dmabuf_sync((buffers[index])[buf_index].fd, true);
+			process_image((buffers[index])[buf.index].start, buf.bytesused, dev);
+			dmabuf_sync((buffers[index])[buf_index].fd, false);
+
+			/* enqueue a buffer */
+			memset(&buf, 0, sizeof(buf));
+			buf.index = buf_index;
+			buf.memory = V4L2_MEMORY_DMABUF;
+			buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+			buf.m.fd = (buffers[index])[buf_index].fd;
+			if (-1 == xioctl(fd[dev], VIDIOC_QBUF, &buf))
+				errno_exit("VIDIOC_QBUF");
+			break;
 	}
 
 	if (fps_count)
@@ -563,6 +647,7 @@ static void stop_capturing(int dev)
 
 		case IO_METHOD_MMAP:
 		case IO_METHOD_USERPTR:
+		case IO_METHOD_DMABUF:
 			type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 			if (-1 == xioctl(fd[dev], VIDIOC_STREAMOFF, &type))
 				errno_exit("VIDIOC_STREAMOFF");
@@ -616,6 +701,28 @@ static void start_capturing(int dev)
 			if (-1 == xioctl(fd[dev], VIDIOC_STREAMON, &type))
 				errno_exit("VIDIOC_STREAMON");
 			break;
+		case IO_METHOD_DMABUF:
+			/* enque dmabufs into v4l2 device */
+			for(i = 0; i < n_buffers[index]; ++i)
+			{
+				struct v4l2_buffer buf;
+
+				CLEAR(buf);
+
+				buf.index = i;
+				buf.memory = V4L2_MEMORY_DMABUF;
+				buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+				buf.m.fd = (buffers[index])[i].fd;
+				if(-1 == xioctl(fd[dev], VIDIOC_QBUF, &buf))
+					errno_exit("VIDIOC_QBUF");
+			}
+
+			/* start v4l2 device */
+			type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+			if (-1 == xioctl(fd[dev], VIDIOC_STREAMON, &type))
+				errno_exit("VIDIOC_STREAMON");
+
+			break;
 	}
 }
 
@@ -639,6 +746,13 @@ static void uninit_device(int dev)
 			for (i = 0; i < n_buffers[index]; ++i)
 				if (-1 == munmap((buffers[index])[i].start, (buffers[index])[i].length))
 					errno_exit("munmap");
+			break;
+		case IO_METHOD_DMABUF:
+			for (i = 0; i < n_buffers[index]; ++i) {
+				if (-1 == munmap((buffers[index])[i].start, (buffers[index])[i].length))
+					errno_exit("munmap");
+			}
+			close(dmabuf_heap_fd);
 			break;
 	}
 
@@ -767,6 +881,78 @@ static void init_userp(unsigned int buffer_size, int dev)
 	}
 }
 
+static void init_dmabuf(int dev)
+{
+	int index = dev - start_dev;
+	struct v4l2_requestbuffers rqbufs;
+
+	/* request buffers from v4l2 device */
+	CLEAR(rqbufs);
+	rqbufs.count = 7;
+	rqbufs.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	rqbufs.memory = V4L2_MEMORY_DMABUF;
+
+	if(-1 == xioctl(fd[dev], VIDIOC_REQBUFS, &rqbufs))
+	{
+		fprintf(stderr, "VIDIOC_REQBUFS: %s\n", strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+
+	if(rqbufs.count < 7)
+	{
+		fprintf(stderr, "VIDIOC_REQBUFS: too few buffers\n");
+		exit(EXIT_FAILURE);
+	}
+
+	buffers[index] = calloc(rqbufs.count, sizeof(*buffers[index]));
+	if (!buffers[index]) {
+		fprintf(stderr, "Out of memory\n");
+		exit(EXIT_FAILURE);
+	}
+
+	dmabuf_heap_fd = dmabuf_heap_open();
+	if(dmabuf_heap_fd < 0)
+	{
+		fprintf(stderr, "Could not open dmabuf-heap\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* allocate and map dmabufs */
+	for(n_buffers[index] = 0; n_buffers[index] < rqbufs.count; ++n_buffers[index])
+	{
+		struct v4l2_buffer buf;
+
+		CLEAR(buf);
+
+		buf.type	= V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buf.memory	= V4L2_MEMORY_DMABUF;
+		buf.index	= n_buffers[index];
+
+		if (-1 == xioctl(fd[dev], VIDIOC_QUERYBUF, &buf))
+			errno_exit("VIDIOC_QUERYBUF");
+
+		(buffers[index])[n_buffers[index]].length = buf.length;
+		(buffers[index])[n_buffers[index]].fd = dmabuf_heap_alloc(dmabuf_heap_fd, NULL, buf.length);
+		if((buffers[index])[n_buffers[index]].fd < 0)
+		{
+			fprintf(stderr, "Failed to alloc dmabuf for %d\n", n_buffers[index]);
+			exit(EXIT_FAILURE);
+		}
+
+		(buffers[index])[n_buffers[index]].start =
+			mmap(NULL,
+				  buf.length,
+				  PROT_READ | PROT_WRITE /* required */,
+				  MAP_SHARED /* recommended */,
+				  (buffers[index])[n_buffers[index]].fd, buf.m.offset);
+		if((buffers[index])[n_buffers[index]].start == MAP_FAILED)
+		{
+			fprintf(stderr, "Failed to map dmabuf %d\n", n_buffers[index]);
+			exit(EXIT_FAILURE);
+		}
+	}
+}
+
 static void init_device(int dev)
 {
 	struct v4l2_capability cap;
@@ -801,6 +987,7 @@ static void init_device(int dev)
 
 		case IO_METHOD_MMAP:
 		case IO_METHOD_USERPTR:
+		case IO_METHOD_DMABUF:
 			if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
 				fprintf(stderr, "%s does not support streaming i/o\n",
 					 dev_name[dev]);
@@ -924,6 +1111,9 @@ static void init_device(int dev)
 
 		case IO_METHOD_USERPTR:
 			init_userp(fmt.fmt.pix.sizeimage, dev);
+			break;
+		case IO_METHOD_DMABUF:
+			init_dmabuf(dev);
 			break;
 	}
 }
@@ -1316,6 +1506,7 @@ static void usage(FILE *fp, char **argv)
 		 "-m | --mmap	   Use memory mapped buffers [default]\n"
 		 "-r | --read	   Use read() calls\n"
 		 "-u | --userp	   Use application allocated buffers\n"
+		 "-a | --dmabuf	   Use dmabuf allocated buffers\n"
 		 "-o | --output	   Outputs stream to stdout\n"
 		 "-F | --output_fb	   Outputs stream to framebuffer: rcar-du, rcar-vcon [%s]\n"
 		 "-f | --format	   Set pixel format: raw10, uyvy, yuyv, rgb565, rgb32, nv12, nv16, bggr8, grey [%s]\n"
@@ -1331,7 +1522,7 @@ static void usage(FILE *fp, char **argv)
 		 argv[0], dev_name[0], n_devs, drmdev_name, format_name, frame_count, LEFT, TOP, WIDTH, HEIGHT, timeout);
 }
 
-static const char short_options[] = "d:D:hmruoF:f:c:zs:L:T:W:H:t:";
+static const char short_options[] = "d:D:hmrauoF:f:c:zs:L:T:W:H:t:";
 
 static const struct option
 long_options[] = {
@@ -1341,6 +1532,7 @@ long_options[] = {
 	{ "mmap",	no_argument,	   NULL, 'm' },
 	{ "read",	no_argument,	   NULL, 'r' },
 	{ "userp",	no_argument,	   NULL, 'u' },
+	{ "dmabuf",	no_argument,	   NULL, 'a' },
 	{ "output", no_argument,	   NULL, 'o' },
 	{ "output_fb", required_argument,	   NULL, 'F' },
 	{ "format", required_argument, NULL, 'f' },
@@ -1409,6 +1601,10 @@ int main(int argc, char **argv)
 
 		case 'm':
 			io = IO_METHOD_MMAP;
+			break;
+
+		case 'a':
+			io = IO_METHOD_DMABUF;
 			break;
 
 		case 'r':
@@ -1539,9 +1735,11 @@ int main(int argc, char **argv)
 		}
 	}
 
-	open_fb();
+	if (out_fb)
+		open_fb();
 	mainloop(start_dev);
-	close_fb();
+	if (out_fb)
+		close_fb();
 
 	for (dev = start_dev; dev < start_dev+n_devs; dev++) {
 		stop_capturing(dev);
