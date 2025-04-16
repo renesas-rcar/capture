@@ -37,7 +37,7 @@
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
-#include <drm_fourcc.h>
+#include <drm/drm_fourcc.h>
 
 #include <linux/cmemdrv.h>
 
@@ -79,7 +79,32 @@ struct modeset_dev {
 	drmModeCrtc *saved_crtc;
 };
 
+struct fmt_info {
+	char	 *name;
+	uint32_t pixelformat;
+	uint32_t fourcc;
+	int		 cpp;
+};
+struct fmt_info formats[] = {
+    { .name = "raw8", .pixelformat = V4L2_PIX_FMT_SRGGB8, .fourcc = DRM_FORMAT_R8, .cpp = 1 },
+    { .name = "raw10", .pixelformat = V4L2_PIX_FMT_SRGGB10,   .fourcc = DRM_FORMAT_R10, .cpp = 2 },
+    { .name = "raw12", .pixelformat = V4L2_PIX_FMT_SRGGB12,   .fourcc = DRM_FORMAT_R12, .cpp = 2 },
+    { .name = "raw14", .pixelformat = V4L2_PIX_FMT_SRGGB14,   .fourcc = DRM_FORMAT_R14, .cpp = 2 },
+    { .name = "raw16", .pixelformat = V4L2_PIX_FMT_SRGGB16,   .fourcc = DRM_FORMAT_R16, .cpp = 2 },
+    { .name = "raw20", .pixelformat = V4L2_PIX_FMT_SRGGB20,   .fourcc = DRM_FORMAT_R20, .cpp = 4 },
+    { .name = "raw24", .pixelformat = V4L2_PIX_FMT_SRGGB24,   .fourcc = DRM_FORMAT_R24, .cpp = 4 },
+    { .name = "raw28", .pixelformat = V4L2_PIX_FMT_SRGGB28,   .fourcc = DRM_FORMAT_R28, .cpp = 4 },
+    { .name = "uyvy", .pixelformat = V4L2_PIX_FMT_UYVY,   .fourcc = DRM_FORMAT_UYVY, .cpp = 2 },
+    { .name = "yuyv", .pixelformat = V4L2_PIX_FMT_YUYV,   .fourcc = DRM_FORMAT_YUYV, .cpp = 2 },
+    { .name = "rgb565", .pixelformat = V4L2_PIX_FMT_RGB565,   .fourcc = DRM_FORMAT_RGB565, .cpp = 2 },
+    { .name = "rgb32", .pixelformat = V4L2_PIX_FMT_XBGR32,   .fourcc = DRM_FORMAT_XRGB8888, .cpp = 4 },
+    { .name = "nv12", .pixelformat = V4L2_PIX_FMT_NV12,   .fourcc = DRM_FORMAT_NV12, .cpp = 2 },
+    { .name = "nv16", .pixelformat = V4L2_PIX_FMT_NV16,   .fourcc = DRM_FORMAT_NV16, .cpp = 2 }
+};
+
+
 static struct modeset_dev *modeset_list = NULL;
+static struct fmt_info output = { 0 };
 
 #define N_DEVS_MAX	16
 static char		n_devs = 1;
@@ -107,7 +132,7 @@ static struct fb_var_screeninfo vinfo;
 static struct fb_fix_screeninfo finfo;
 static long int screensize = 0;
 static char *fbmem = 0;
-static uint32_t output_fourcc = DRM_FORMAT_ABGR8888;
+//static uint32_t output_fourcc = DRM_FORMAT_ABGR8888;
 static int start_dev = 0;
 
 int cmem;
@@ -327,50 +352,62 @@ static void process_image(const void *p, int size, int dev)
 	int index = dev - start_dev;
 
 	if (out_buf) {
-		char *buf = (char *)p;
-		int g_srcsize = 0;
+		if (strcmp(output.name, "rgb32") != 0 &&
+			strcmp(output.name, "raw10") != 0 &&
+			strcmp(output.name, "raw12") != 0 &&
+			strcmp(output.name, "raw14") != 0 &&
+			strcmp(output.name, "raw16") != 0 &&
+			strcmp(output.name, "raw20") != 0 &&
+			strcmp(output.name, "raw24") != 0 &&
+			strcmp(output.name, "raw28") != 0) {
+			fprintf(stderr, "format not supported to output to file\n");
+			return;
+		}
 
-		if (!strncmp(format_name, "rgb32", 5)) {
-			g_srcsize = (WIDTH * HEIGHT) * 3;
+		char *buf = (char *)p;
+		int g_size = 0;
+		int g_srcsize = (WIDTH * HEIGHT) * output.cpp;
+
+		g_temp = (unsigned char *)malloc(sizeof(unsigned char) * g_srcsize);
+
+		if (strcmp(output.name, "rgb32") == 0) {
 			fprintf(g_fp, "P6\n");//! type
 			fprintf(g_fp, "%d %d\n", WIDTH, HEIGHT); //! width & height
 			fprintf(g_fp, "255 ");//! tone
-
-			fprintf(stderr, "copying a ppm!\n");
-			memcpy(g_temp, buf, size);
-
-			Conv_ARGB88882RGB888(g_temp, g_dst, WIDTH, HEIGHT);
-
-			fprintf(stderr, "writing a ppm!\n");
-			fwrite(g_dst, sizeof(unsigned char), g_srcsize, g_fp);
-			fflush (g_fp);
-
-			if (g_dst)
-				free(g_dst);
-			if (g_temp)
-				free(g_temp);
-			fclose(g_fp);
-
-		} else if (!strncmp(format_name, "raw10", 5)) {
-			g_srcsize = (WIDTH * HEIGHT) * 2;
-
-			fprintf(stderr, "copying a raw!\n");
-			memcpy(g_temp, buf, size);
-
-			fprintf(stderr, "writing a raw!\n");
-			fwrite(g_temp, sizeof(unsigned char), g_srcsize, g_fp);
-			fflush (g_fp);
-
-			if (g_temp)
-				free(g_temp);
-			fclose(g_fp);
-		} else {
-			fprintf(stderr, "format not supported to output to file\n");
 		}
+
+		fprintf(stderr, "copying a image!\n");
+		memcpy(g_temp, buf, size);
+		
+		if (strcmp(output.name, "rgb32") == 0) {
+			g_size = (WIDTH * HEIGHT) * 3;	/* size of output RGB888 */
+			g_dst = (unsigned char *)malloc(sizeof(unsigned char) * g_size);
+			Conv_ARGB88882RGB888(g_temp, g_dst, WIDTH, HEIGHT);
+			free(g_temp);
+		} else {
+			g_size = g_srcsize;	/* output got the same size with input */
+			g_dst = g_temp;
+		}
+
+		fprintf(stderr, "writing a image!\n");
+		fwrite(g_dst, sizeof(unsigned char), g_size, g_fp);
+
+		fflush (g_fp);
+
+		if (g_dst)
+			free(g_dst);
+		fclose(g_fp);
 	}
 
 	if (out_fb) {
-		if (!strncmp(format_name, "rgb32", 5) | !strncmp(format_name, "raw10", 5)) {
+		if (strcmp(output.name, "rgb32") == 0 ||
+			strcmp(output.name, "raw10") == 0 ||
+			strcmp(output.name, "raw12") == 0 ||
+			strcmp(output.name, "raw14") == 0 ||
+			strcmp(output.name, "raw16") == 0 ||
+			strcmp(output.name, "raw20") == 0 ||
+			strcmp(output.name, "raw24") == 0 ||
+			strcmp(output.name, "raw28") == 0) {
 			int i;
 			int offset = (WIDTH*4)*(index%(n_devs > 4 ? 4 : 2)) + (HEIGHT*modeset_list->stride)*(index/(n_devs > 4 ? 4 : 2));
 			unsigned char *fbp = (unsigned char *)modeset_list->map + offset;
@@ -382,7 +419,7 @@ static void process_image(const void *p, int size, int dev)
 				buf += (WIDTH*4);
 			}
 
-		} else if (!strncmp(format_name, "uyvy", 4)) {
+		} else if (strcmp(output.name, "uyvy") == 0) {
 			/* for UYVY from camera: covert UYVY to RGB32 */
 			int i, j;
 			unsigned char *fbp = (unsigned char *)fbmem;
@@ -404,8 +441,8 @@ static void process_image(const void *p, int size, int dev)
 				fbp += finfo.line_length;
 				buf += (WIDTH*2);
 			}
-		} else if (!strncmp(format_name, "bggr8", 5)) {
-		} else if (!strncmp(format_name, "bggr12", 6)) {
+		} else if (strcmp(output.name, "bggr8") == 0) {
+		} else if (strcmp(output.name, "bggr12") == 0) {
 			int i, j, k;
 			unsigned char *fbp = (unsigned char *)fbmem;
 			char *buf = (char *)p;
@@ -456,29 +493,32 @@ static int read_frame(int dev, int count)
 
 	if (out_buf) {
 		char filename[60];
-		int g_size = (WIDTH * HEIGHT) * 3;
-		int g_srcsize = 0;
 		time_t current_time = 0;
+		char *extension = "";
 
 		time(&current_time);
 
-		if (!strncmp(format_name, "rgb32", 5)) {
-			g_srcsize = (WIDTH * HEIGHT) * 4;
-			snprintf(filename, 60, "cap_%ld_video%d_%s_l%d_t%d_%dx%d_frame%d.ppm", current_time, dev, format_name, LEFT, TOP, WIDTH, HEIGHT, count);
+		if (strcmp(output.name, "rgb32") == 0) {
+			extension = "ppm";
 
-		} else if (!strncmp(format_name, "raw10", 5)) {
-			g_srcsize = (WIDTH * HEIGHT) * 2;
-			snprintf(filename, 60, "cap_%ld_video%d_%s_l%d_t%d_%dx%d_frame%d.raw", current_time, dev, format_name, LEFT, TOP, WIDTH, HEIGHT, count);
+		} else if (strcmp(output.name, "raw10") == 0 ||
+				   strcmp(output.name, "raw12") == 0 ||
+				   strcmp(output.name, "raw13") == 0 ||
+				   strcmp(output.name, "raw16") == 0 ||
+				   strcmp(output.name, "raw20") == 0 ||
+				   strcmp(output.name, "raw24") == 0 ||
+				   strcmp(output.name, "raw28") == 0) {
+			extension = "raw";
 		}
 		else {
 			fprintf(stderr, "format not supported to output to file\n");
+			return 0;
 		}
 
+		snprintf(filename, 60, "cap_%ld_video%d_%s_l%d_t%d_%dx%d_frame%d.%s", current_time, dev, output.name, LEFT, TOP, WIDTH, HEIGHT, count, extension);
 		fprintf(stderr, "File name: %s\n", filename);
 
 		g_fp = fopen(filename, "wb");
-		g_dst = (unsigned char *)malloc(sizeof(unsigned char) * g_size);
-		g_temp = (unsigned char *)malloc(sizeof(unsigned char) * g_srcsize);
 	}
 
 	switch (io) {
@@ -517,7 +557,6 @@ static int read_frame(int dev, int count)
 			}
 
 			assert(buf.index < n_buffers[index]);
-
 			process_image((buffers[index])[buf.index].start, buf.bytesused, dev);
 
 			if (-1 == xioctl(fd[dev], VIDIOC_QBUF, &buf))
@@ -611,7 +650,7 @@ static void mainloop(int start_dev)
 			tv.tv_usec = 0;
 
 			r = select(max(max(max(max(fd[0],fd[1]), max(fd[2],fd[3])), max(max(fd[4],fd[5]), max(fd[6],fd[7]))), max(max(max(fd[8],fd[9]), max(fd[10],fd[11])), max(max(fd[12],fd[13]), max(fd[14],fd[15])))) + 1, &fds, NULL, NULL, &tv);
-//			  r = select((max(max(max(fd[0],fd[1]),max(fd[2],fd[3])),max(max(fd[4],fd[5]),max(fd[6],fd[7]))),max(max(fd[8],fd[9]),max(fd[10],fd[11]))) + 1, &fds, NULL, NULL, &tv);
+
 			if (-1 == r) {
 				if (EINTR == errno)
 					continue;
@@ -1043,59 +1082,22 @@ static void init_device(int dev)
 	fmt.fmt.pix.height = HEIGHT;
 	fmt.fmt.pix.field  = FIELD;
 
-	if (!strncmp(format_name, "uyvy", 4))
-	{
-		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_UYVY;
-		output_fourcc = DRM_FORMAT_UYVY;
+	int found = 0;
+	for (int i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
+		if (strcmp(format_name, formats[i].name) == 0) {
+			output = formats[i];
+			found = 1;
+			break;
+		}
 	}
-	else if (!strncmp(format_name, "yuyv", 4))
-	{
-		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
-		output_fourcc = DRM_FORMAT_YUYV;
-	}
-	else if (!strncmp(format_name, "rgb565", 6))
-	{
-		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_RGB565;
-		output_fourcc = DRM_FORMAT_RGB565;
-	}
-	else if (!strncmp(format_name, "rgb32", 5))
-	{
-		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_XBGR32;
-		output_fourcc = DRM_FORMAT_XRGB8888;
-	}
-	else if (!strncmp(format_name, "raw10", 5))
-	{
-		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_Y10;
-		output_fourcc = DRM_FORMAT_Y210; /* For camera leopart GSML */
-	}
-	else if (!strncmp(format_name, "nv12", 4))
-	{
-		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
-		output_fourcc = DRM_FORMAT_NV12;
-	}
-	else if (!strncmp(format_name, "nv16", 4))
-	{
-		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV16;
-		output_fourcc = DRM_FORMAT_NV16;
-	}
-	else if (!strncmp(format_name, "bggr8", 5))
-	{
-		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_SBGGR8;
-	}
-	else if (!strncmp(format_name, "bggr12", 6))
-	{
-		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_SBGGR12;
-	}
-	else if (!strncmp(format_name, "grey", 4))
-	{
-		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_GREY;
-	}
-	else
-	{
+	
+	if (!found) {
 		/* Preserve original settings as set by v4l2-ctl for example */
 		if (-1 == xioctl(fd[dev], VIDIOC_G_FMT, &fmt))
 			errno_exit("VIDIOC_G_FMT");
 	}
+
+	fmt.fmt.pix.pixelformat = output.pixelformat;
 
 	if (-1 == xioctl(fd[dev], VIDIOC_S_FMT, &fmt))
 		errno_exit("VIDIOC_S_FMT");
@@ -1231,7 +1233,7 @@ static int modeset_create_fb(int fd, struct modeset_dev *dev)
 
 	/* create framebuffer object for the dumb-buffer */
 	{
-	uint32_t fourcc = output_fourcc;
+	uint32_t fourcc = output.fourcc;
 	uint32_t offsets[4] = { 0 };
 	uint32_t pitches[4] = {dev->stride};
 	uint32_t bo_handles[4] = {dev->handle};
@@ -1509,7 +1511,7 @@ static void usage(FILE *fp, char **argv)
 		 "-a | --dmabuf	   Use dmabuf allocated buffers\n"
 		 "-o | --output	   Outputs stream to stdout\n"
 		 "-F | --output_fb	   Outputs stream to framebuffer: rcar-du, rcar-vcon [%s]\n"
-		 "-f | --format	   Set pixel format: raw10, uyvy, yuyv, rgb565, rgb32, nv12, nv16, bggr8, grey [%s]\n"
+		 "-f | --format	   Set pixel format: raw8, raw10, raw12, raw14, raw16, raw20, raw24, raw28, uyvy, yuyv, rgb565, rgb32, nv12, nv16, bggr8, grey [%s]\n"
 		 "-c | --count	   Number of frames to grab [%i]\n"
 		 "-z | --fps_count	   Enable fps show\n"
 		 "-s | --framerate	   Set framerate\n"
