@@ -503,7 +503,7 @@ static int read_frame(int dev, int count)
 
 		} else if (strcmp(output.name, "raw10") == 0 ||
 				   strcmp(output.name, "raw12") == 0 ||
-				   strcmp(output.name, "raw13") == 0 ||
+				   strcmp(output.name, "raw14") == 0 ||
 				   strcmp(output.name, "raw16") == 0 ||
 				   strcmp(output.name, "raw20") == 0 ||
 				   strcmp(output.name, "raw24") == 0 ||
