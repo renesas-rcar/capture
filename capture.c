@@ -44,6 +44,8 @@
 #include <linux/dma-buf.h>
 #include <linux/dma-heap.h>
 
+#include "opencv_helper.h"
+
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 
 //#define FIELD V4L2_FIELD_INTERLACED
@@ -84,22 +86,23 @@ struct fmt_info {
 	uint32_t pixelformat;
 	uint32_t fourcc;
 	int		 cpp;
+	int		 bpp;
 };
 struct fmt_info formats[] = {
-    { .name = "raw8", .pixelformat = V4L2_PIX_FMT_SRGGB8, .fourcc = DRM_FORMAT_R8, .cpp = 1 },
-    { .name = "raw10", .pixelformat = V4L2_PIX_FMT_SRGGB10,   .fourcc = DRM_FORMAT_R10, .cpp = 2 },
-    { .name = "raw12", .pixelformat = V4L2_PIX_FMT_SRGGB12,   .fourcc = DRM_FORMAT_R12, .cpp = 2 },
-    { .name = "raw14", .pixelformat = V4L2_PIX_FMT_SRGGB14,   .fourcc = DRM_FORMAT_R14, .cpp = 2 },
-    { .name = "raw16", .pixelformat = V4L2_PIX_FMT_SRGGB16,   .fourcc = DRM_FORMAT_R16, .cpp = 2 },
-    { .name = "raw20", .pixelformat = V4L2_PIX_FMT_SRGGB20,   .fourcc = DRM_FORMAT_R20, .cpp = 4 },
-    { .name = "raw24", .pixelformat = V4L2_PIX_FMT_SRGGB24,   .fourcc = DRM_FORMAT_R24, .cpp = 4 },
-    { .name = "raw28", .pixelformat = V4L2_PIX_FMT_SRGGB28,   .fourcc = DRM_FORMAT_R28, .cpp = 4 },
-    { .name = "uyvy", .pixelformat = V4L2_PIX_FMT_UYVY,   .fourcc = DRM_FORMAT_UYVY, .cpp = 2 },
-    { .name = "yuyv", .pixelformat = V4L2_PIX_FMT_YUYV,   .fourcc = DRM_FORMAT_YUYV, .cpp = 2 },
-    { .name = "rgb565", .pixelformat = V4L2_PIX_FMT_RGB565,   .fourcc = DRM_FORMAT_RGB565, .cpp = 2 },
-    { .name = "rgb32", .pixelformat = V4L2_PIX_FMT_XBGR32,   .fourcc = DRM_FORMAT_XRGB8888, .cpp = 4 },
-    { .name = "nv12", .pixelformat = V4L2_PIX_FMT_NV12,   .fourcc = DRM_FORMAT_NV12, .cpp = 2 },
-    { .name = "nv16", .pixelformat = V4L2_PIX_FMT_NV16,   .fourcc = DRM_FORMAT_NV16, .cpp = 2 }
+    { .name = "raw8", .pixelformat = V4L2_PIX_FMT_SRGGB8, .fourcc = DRM_FORMAT_R8, .cpp = 1, .bpp = 8 },
+    { .name = "raw10", .pixelformat = V4L2_PIX_FMT_SRGGB10,   .fourcc = DRM_FORMAT_R10, .cpp = 2, .bpp = 10 },
+    { .name = "raw12", .pixelformat = V4L2_PIX_FMT_SRGGB12,   .fourcc = DRM_FORMAT_R12, .cpp = 2, .bpp = 12 },
+    { .name = "raw14", .pixelformat = V4L2_PIX_FMT_SRGGB14,   .fourcc = DRM_FORMAT_R14, .cpp = 2, .bpp = 14 },
+    { .name = "raw16", .pixelformat = V4L2_PIX_FMT_SRGGB16,   .fourcc = DRM_FORMAT_R16, .cpp = 2, .bpp = 16 },
+    { .name = "raw20", .pixelformat = V4L2_PIX_FMT_SRGGB20,   .fourcc = DRM_FORMAT_R20, .cpp = 4, .bpp = 20 },
+    { .name = "raw24", .pixelformat = V4L2_PIX_FMT_SRGGB24,   .fourcc = DRM_FORMAT_R24, .cpp = 4, .bpp = 24 },
+    { .name = "raw28", .pixelformat = V4L2_PIX_FMT_SRGGB28,   .fourcc = DRM_FORMAT_R28, .cpp = 4, .bpp = 28 },
+    { .name = "uyvy", .pixelformat = V4L2_PIX_FMT_UYVY,   .fourcc = DRM_FORMAT_UYVY, .cpp = 2, .bpp = 16 },
+    { .name = "yuyv", .pixelformat = V4L2_PIX_FMT_YUYV,   .fourcc = DRM_FORMAT_YUYV, .cpp = 2, .bpp = 16 },
+    { .name = "rgb565", .pixelformat = V4L2_PIX_FMT_RGB565,   .fourcc = DRM_FORMAT_RGB565, .cpp = 2, .bpp = 16 },
+    { .name = "rgb32", .pixelformat = V4L2_PIX_FMT_XBGR32,   .fourcc = DRM_FORMAT_XRGB8888, .cpp = 4, .bpp = 32 },
+    { .name = "nv12", .pixelformat = V4L2_PIX_FMT_NV12,   .fourcc = DRM_FORMAT_NV12, .cpp = 3/2, .bpp = 16 },
+    { .name = "nv16", .pixelformat = V4L2_PIX_FMT_NV16,   .fourcc = DRM_FORMAT_NV16, .cpp = 2, .bpp = 16 }
 };
 
 
@@ -126,13 +129,12 @@ static int		framerate = 0;
 static int		timeout = 60; // secs
 static int		LEFT = 0;
 static int		TOP = 0;
-static int		WIDTH = 1920;
-static int		HEIGHT = 1080;
+static int		WIDTH = 3840;
+static int		HEIGHT = 2160;
 static struct fb_var_screeninfo vinfo;
 static struct fb_fix_screeninfo finfo;
 static long int screensize = 0;
 static char *fbmem = 0;
-//static uint32_t output_fourcc = DRM_FORMAT_ABGR8888;
 static int start_dev = 0;
 
 int cmem;
@@ -412,12 +414,21 @@ static void process_image(const void *p, int size, int dev)
 			int offset = (WIDTH*4)*(index%(n_devs > 4 ? 4 : 2)) + (HEIGHT*modeset_list->stride)*(index/(n_devs > 4 ? 4 : 2));
 			unsigned char *fbp = (unsigned char *)modeset_list->map + offset;
 			char *buf = (char *)p;
+			char *buf_rgb = malloc(WIDTH * HEIGHT * 4);
+			if (!buf_rgb)
+				exit(EXIT_FAILURE);
 
+			convert_bayer_to_rgb(buf, WIDTH, HEIGHT, output.bpp, buf_rgb);
+
+			char* tmp_buf = buf_rgb;
 			for (i = 0; i < HEIGHT; i++) {
-				memcpy(fbp, buf, WIDTH*4);
+				memcpy(fbp, tmp_buf, WIDTH*4);
 				fbp += modeset_list->stride;
-				buf += (WIDTH*4);
+				tmp_buf += (WIDTH*4);
 			}
+
+			free(buf_rgb);
+			buf_rgb = NULL;
 
 		} else if (strcmp(output.name, "uyvy") == 0) {
 			/* for UYVY from camera: covert UYVY to RGB32 */
@@ -1233,7 +1244,7 @@ static int modeset_create_fb(int fd, struct modeset_dev *dev)
 
 	/* create framebuffer object for the dumb-buffer */
 	{
-	uint32_t fourcc = output.fourcc;
+	uint32_t fourcc = DRM_FORMAT_XRGB8888;
 	uint32_t offsets[4] = { 0 };
 	uint32_t pitches[4] = {dev->stride};
 	uint32_t bo_handles[4] = {dev->handle};
