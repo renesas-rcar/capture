@@ -44,6 +44,9 @@
 #include <linux/dma-buf.h>
 #include <linux/dma-heap.h>
 
+#include <pthread.h>
+#include <semaphore.h>
+
 #include "opencv_helper.h"
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
@@ -136,6 +139,13 @@ static struct fb_fix_screeninfo finfo;
 static long int screensize = 0;
 static char *fbmem = 0;
 static int start_dev = 0;
+
+char *latest_frame = NULL;   // shared buffer
+unsigned long frame_size = 0;
+int cur_device = -1;
+
+pthread_mutex_t frame_lock = PTHREAD_MUTEX_INITIALIZER;
+sem_t sem;
 
 int cmem;
 #define N_BUFFERS_MAX	   32
@@ -380,7 +390,7 @@ static void process_image(const void *p, int size, int dev)
 
 		fprintf(stderr, "copying a image!\n");
 		memcpy(g_temp, buf, size);
-		
+
 		if (strcmp(output.name, "rgb32") == 0) {
 			g_size = (WIDTH * HEIGHT) * 3;	/* size of output RGB888 */
 			g_dst = (unsigned char *)malloc(sizeof(unsigned char) * g_size);
@@ -394,11 +404,8 @@ static void process_image(const void *p, int size, int dev)
 		fprintf(stderr, "writing a image!\n");
 		fwrite(g_dst, sizeof(unsigned char), g_size, g_fp);
 
-		fflush (g_fp);
-
 		if (g_dst)
 			free(g_dst);
-		fclose(g_fp);
 	}
 
 	if (out_fb) {
@@ -500,7 +507,6 @@ static int read_frame(int dev, int count)
 	struct v4l2_buffer buf;
 	unsigned int i;
 	int index = dev - start_dev;
-	int buf_index;
 
 	if (out_buf) {
 		char filename[60];
@@ -546,7 +552,13 @@ static int read_frame(int dev, int count)
 				}
 			}
 
-			process_image((buffers[index])[0].start, (buffers[index])[0].length, dev);
+			pthread_mutex_lock(&frame_lock);
+			if (frame_size != (buffers[index])[0].length)
+				break;
+			cur_device = dev;
+			memcpy(latest_frame, (buffers[index])[0].start, frame_size);
+			pthread_mutex_unlock(&frame_lock);
+
 			break;
 
 		case IO_METHOD_MMAP:
@@ -566,9 +578,14 @@ static int read_frame(int dev, int count)
 						errno_exit("VIDIOC_DQBUF");
 				}
 			}
-
 			assert(buf.index < n_buffers[index]);
-			process_image((buffers[index])[buf.index].start, buf.bytesused, dev);
+
+			pthread_mutex_lock(&frame_lock);
+			if (frame_size != buf.bytesused)
+				break;
+			cur_device = dev;
+			memcpy(latest_frame, (buffers[index])[buf.index].start, frame_size);
+			pthread_mutex_unlock(&frame_lock);
 
 			if (-1 == xioctl(fd[dev], VIDIOC_QBUF, &buf))
 				errno_exit("VIDIOC_QBUF");
@@ -599,7 +616,12 @@ static int read_frame(int dev, int count)
 
 			assert(i < n_buffers[index]);
 
-			process_image((void *)buf.m.userptr, buf.bytesused, dev);
+			pthread_mutex_lock(&frame_lock);
+			if (frame_size != buf.bytesused)
+				break;
+			cur_device = dev;
+			memcpy(latest_frame, (void *)buf.m.userptr, frame_size);
+			pthread_mutex_unlock(&frame_lock);
 
 			if (-1 == xioctl(fd[dev], VIDIOC_QBUF, &buf))
 				errno_exit("VIDIOC_QBUF");
@@ -614,18 +636,16 @@ static int read_frame(int dev, int count)
 			if (-1 == xioctl(fd[dev], VIDIOC_DQBUF, &buf))
 				errno_exit("VIDIOC_DQBUF");
 
-			buf_index = buf.index;
-
-			dmabuf_sync((buffers[index])[buf_index].fd, true);
-			process_image((buffers[index])[buf.index].start, buf.bytesused, dev);
-			dmabuf_sync((buffers[index])[buf_index].fd, false);
+			pthread_mutex_lock(&frame_lock);
+			if (frame_size != buf.bytesused)
+				break;
+			cur_device = dev;
+			dmabuf_sync((buffers[index])[buf.index].fd, true);
+			memcpy(latest_frame, (buffers[index])[buf.index].start, frame_size);
+			dmabuf_sync((buffers[index])[buf.index].fd, false);
+			pthread_mutex_unlock(&frame_lock);
 
 			/* enqueue a buffer */
-			memset(&buf, 0, sizeof(buf));
-			buf.index = buf_index;
-			buf.memory = V4L2_MEMORY_DMABUF;
-			buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-			buf.m.fd = (buffers[index])[buf_index].fd;
 			if (-1 == xioctl(fd[dev], VIDIOC_QBUF, &buf))
 				errno_exit("VIDIOC_QBUF");
 			break;
@@ -639,8 +659,9 @@ static int read_frame(int dev, int count)
 
 #define max(a,b) (a>b?a:b)
 
-static void mainloop(int start_dev)
-{
+bool done_flag = false;
+
+void *capture_thread(void *arg) {
 	unsigned int count = frame_count;
 	int dev = 0;
 	fd_set fds;
@@ -649,7 +670,6 @@ static void mainloop(int start_dev)
 
 	/* Give time to queue buffers at start streaming by VIN module */
 //	  usleep(34000*3);
-
 	while (count-- > 0) {
 		for (;;) {
 			FD_ZERO(&fds);
@@ -677,13 +697,48 @@ static void mainloop(int start_dev)
 			for (dev = start_dev; dev < start_dev+n_devs; dev++) {
 				if (FD_ISSET(fd[dev], &fds))
 					r += read_frame(dev, frame_count - count);
-//					  usleep(30000);
 			}
-			if (r)
+			if (r) {
+				sem_post(&sem);  // wake up processing_thread
 				break;
+			}
 			/* EAGAIN - continue select loop. */
 		}
 	}
+	done_flag = true;
+
+    return NULL;
+}
+
+void *processing_thread(void *arg) {
+	while (!done_flag) {
+		sem_wait(&sem);  // block until capture_thread finishes
+
+		pthread_mutex_lock(&frame_lock);
+		// Process latest_frame
+		process_image(latest_frame, frame_size, cur_device);
+		// Example: convert to RGB, run OpenCV, or save to file
+		pthread_mutex_unlock(&frame_lock);
+	}
+
+    return NULL;
+}
+
+static void mainloop(int start_dev)
+{
+	pthread_t cap_tid, proc_tid;
+	sem_init(&sem, 0, 0);
+
+    frame_size = WIDTH * HEIGHT * output.cpp; // e.g., YUYV
+    latest_frame = malloc(frame_size);
+
+    pthread_create(&cap_tid, NULL, capture_thread, NULL);
+    pthread_create(&proc_tid, NULL, processing_thread, NULL);
+
+    pthread_join(cap_tid, NULL);
+    pthread_join(proc_tid, NULL);
+
+	sem_destroy(&sem);
 }
 
 static void stop_capturing(int dev)
