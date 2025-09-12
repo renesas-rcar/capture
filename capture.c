@@ -287,7 +287,7 @@ int cmem_alloc(size_t size, off_t offset, unsigned int *phard_addr, void **puser
 static int dmabuf_heap_open()
 {
 	int i;
-	static const char *heap_names[] = { "/dev/dma_heap/linux,cma@64000000", "/dev/dma_heap/system" };
+	static const char *heap_names[] = { "/dev/dma_heap/linux,cma@a2600000", "/dev/dma_heap/system" };
 
 	for(i = 0; i < 2; i++)
 	{
