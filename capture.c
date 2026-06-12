@@ -1425,21 +1425,10 @@ static int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn,
 	return -ENOENT;
 }
 
-int modeset_find_mode_index(drmModeConnector *conn, const char *name, int refresh_hz) {
-	for (int i = 0; i < conn->count_modes; i++) {
-		drmModeModeInfo *mode = &conn->modes[i];
-
-		if (strcmp(mode->name, name) == 0 && mode->vrefresh == refresh_hz) {
-			return i;
-		}
-	}
-	return -1;
-}
-
 static int modeset_setup_dev(int fd, drmModeRes *res, drmModeConnector *conn,
 		 struct modeset_dev *dev)
 {
-	int ret, idx;
+	int ret;
 
 	/* check if a monitor is connected */
 	if (conn->connection != DRM_MODE_CONNECTED) {
@@ -1455,16 +1444,10 @@ static int modeset_setup_dev(int fd, drmModeRes *res, drmModeConnector *conn,
 		return -EFAULT;
 	}
 
-	idx = modeset_find_mode_index(conn, "1920x1080", 60);
-	if (idx < 0) {
-		printf("No suitable mode (1920x1080@60) found for the connector\n");
-		return -ENOENT;
-	}
-
 	/* copy the mode information into our device structure */
-	memcpy(&dev->mode, &conn->modes[idx], sizeof(dev->mode));
-	dev->width = conn->modes[idx].hdisplay;
-	dev->height = conn->modes[idx].vdisplay;
+	memcpy(&dev->mode, &conn->modes[0], sizeof(dev->mode));
+	dev->width = conn->modes[0].hdisplay;
+	dev->height = conn->modes[0].vdisplay;
 	fprintf(stderr, "mode for connector %u is %ux%u\n",
 	conn->connector_id, dev->width, dev->height);
 
