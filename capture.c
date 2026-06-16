@@ -1474,9 +1474,8 @@ static int modeset_prepare(int fd)
 {
 	drmModeRes *res;
 	drmModeConnector *conn;
-	unsigned int i;
+	int i, ret;
 	struct modeset_dev *dev;
-	int ret;
 
 	/* retrieve resources */
 	res = drmModeGetResources(fd);
@@ -1487,12 +1486,26 @@ static int modeset_prepare(int fd)
 	}
 
 	/* iterate all connectors */
-	for (i = 0; i < res->count_connectors; ++i) {
+	for (i = res->count_connectors - 1; i >= 0; i--) {
 		/* get information for each connector */
 		conn = drmModeGetConnector(fd, res->connectors[i]);
 		if (!conn) {
 			fprintf(stderr, "cannot retrieve DRM connector %u:%u (%d): %m\n",
 			i, res->connectors[i], errno);
+			continue;
+		}
+
+		/* skip if not connected */
+		if (conn->connection != DRM_MODE_CONNECTED) {
+			fprintf(stderr, "connector %u NOT connected, skip\n", conn->connector_id);
+			drmModeFreeConnector(conn);
+			continue;
+		}
+
+		/* skip if no valid mode */
+		if (conn->count_modes <= 0) {
+			fprintf(stderr, "connector %u has NO valid modes, skip\n", conn->connector_id);
+			drmModeFreeConnector(conn);
 			continue;
 		}
 
